@@ -777,7 +777,7 @@ def create_subnet(vpc_id=None, cidr_block=None, vpc_name=None,
     return _create_resource('subnet', name=subnet_name, tags=tags,
                             vpc_id=vpc_id, cidr_block=cidr_block,
                             region=region, key=key, keyid=keyid,
-                            profile=profile)
+                            profile=profile, availability_zone=availability_zone)
 
 
 def delete_subnet(subnet_id=None, subnet_name=None, region=None, key=None,
@@ -2115,7 +2115,7 @@ def describe_route_table(route_table_id=None, route_table_name=None,
         route_tables = conn.get_all_route_tables(**filter_parameters)
 
         if not route_tables:
-            return False
+            return {}
 
         route_table = {}
         keys = ['id', 'vpc_id', 'tags', 'routes', 'associations']

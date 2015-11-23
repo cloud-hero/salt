@@ -63,7 +63,6 @@ class RosterMatcher(object):
                 data = self.get_data(minion)
                 if data:
                     minions[minion] = data
-        log.info('minions list: {0}'.format(minions))
         return minions
 
     def ret_pcre_minions(self):
@@ -76,7 +75,6 @@ class RosterMatcher(object):
                 data = self.get_data(minion)
                 if data:
                     minions[minion] = data
-        log.info('minions list: {0}'.format(minions))
         return minions
 
     def ret_list_minions(self):
@@ -84,8 +82,26 @@ class RosterMatcher(object):
         Return minions that match via list
         '''
         minions = {}
+        if not isinstance(self.tgt, list):
+            self.tgt = self.tgt.split(',')
         for minion in self.raw:
             if minion in self.tgt:
+                data = self.get_data(minion)
+                if data:
+                    minions[minion] = data
+        return minions
+
+    def ret_nodegroup_minions(self):
+        '''
+        Return minions which match the special list-only groups defined by
+        ssh_list_nodegroups
+        '''
+        minions = {}
+        nodegroup = __opts__.get('ssh_list_nodegroups', {}).get(self.tgt, [])
+        if not isinstance(nodegroup, list):
+            nodegroup = nodegroup.split(',')
+        for minion in self.raw:
+            if minion in nodegroup:
                 data = self.get_data(minion)
                 if data:
                     minions[minion] = data

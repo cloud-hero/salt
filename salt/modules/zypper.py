@@ -32,6 +32,7 @@ HAS_ZYPP = False
 ZYPP_HOME = '/etc/zypp'
 LOCKS = '{0}/locks'.format(ZYPP_HOME)
 REPOS = '{0}/repos.d'.format(ZYPP_HOME)
+DEFAULT_PRIORITY = 99
 
 # Define the module's virtual name
 __virtualname__ = 'pkg'
@@ -92,7 +93,7 @@ def list_upgrades(refresh=True):
     return ret
 
 # Provide a list_updates function for those used to using zypper list-updates
-list_updates = list_upgrades
+list_updates = salt.utils.alias_function(list_upgrades, 'list_updates')
 
 
 def info_installed(*names):
@@ -159,13 +160,13 @@ def info_available(*names, **kwargs):
             kw = [data.strip() for data in line.split(":", 1)]
             if len(kw) == 2 and kw[1]:
                 nfo[kw[0].lower()] = kw[1]
-        if nfo.get("name"):
-            name = nfo.pop("name")
+        if nfo.get('name'):
+            name = nfo.pop('name')
             ret[name] = nfo
-        if nfo.get("status"):
-            nfo['status'] = nfo.get("status").split(" ")[0]
-        if nfo.get("installed"):
-            nfo['installed'] = nfo.get("installed").lower() == "yes" and True or False
+        if nfo.get('status'):
+            nfo['status'] = nfo.get('status')
+        if nfo.get('installed'):
+            nfo['installed'] = nfo.get('installed').lower() == 'yes' and True or False
 
     return ret
 
@@ -214,13 +215,17 @@ def latest_version(*names, **kwargs):
     for name in names:
         pkg_info = package_info.get(name, {})
         if pkg_info.get('status', '').lower() in ['not installed', 'out-of-date']:
-            ret[name] = pkg_info
+            ret[name] = pkg_info.get('version')
+
+    # Return a string if only one package name passed
+    if len(names) == 1 and len(ret):
+        return ret[names[0]]
 
     return ret
 
 
 # available_version is being deprecated
-available_version = latest_version
+available_version = salt.utils.alias_function(latest_version, 'available_version')
 
 
 def upgrade_available(name):
@@ -497,6 +502,12 @@ def mod_repo(repo, **kwargs):
 
     if kwargs.get('gpgautoimport') is True:
         cmd_opt.append('--gpg-auto-import-keys')
+
+    if 'priority' in kwargs:
+        cmd_opt.append("--priority='{0}'".format(kwargs.get('priority', DEFAULT_PRIORITY)))
+
+    if 'humanname' in kwargs:
+        cmd_opt.append("--name='{0}'".format(kwargs.get('humanname')))
 
     if cmd_opt:
         __salt__['cmd.run'](('zypper -x mr {0} \'{1}\''.format(' '.join(cmd_opt), repo)),

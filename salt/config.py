@@ -59,8 +59,8 @@ else:
     _DFLT_MULTIPROCESSING_MODE = True
 
 FLO_DIR = os.path.join(
-        os.path.dirname(__file__),
-        'daemons', 'flo')
+            os.path.dirname(os.path.dirname(__file__)),
+            'daemons', 'flo')
 
 VALID_OPTS = {
     # The address of the salt master. May be specified as IP address or hostname
@@ -341,7 +341,7 @@ VALID_OPTS = {
     # The grains dictionary for a minion, containing specific "facts" about the minion
     'grains': dict,
 
-    # Allow a deamon to function even if the key directories are not secured
+    # Allow a daemon to function even if the key directories are not secured
     'permissive_pki_access': bool,
 
     # The path to a directory to pull in configuration file includes
@@ -371,7 +371,7 @@ VALID_OPTS = {
     'recon_randomize': float,  # FIXME This should really be a bool, according to the implementation
 
     'return_retry_timer': int,
-    'return_retry_random': bool,
+    'return_retry_timer_max': int,
 
     # Specify a returner in which all events will be sent to. Requires that the returner in question
     # have an event_return(event) function!
@@ -387,7 +387,7 @@ VALID_OPTS = {
     # Events matching a tag in this list should never be sent to an event returner.
     'event_return_blacklist': list,
 
-    # This pidfile to write out to when a deamon starts
+    # This pidfile to write out to when a daemon starts
     'pidfile': str,
 
     # Used with the SECO range master tops system
@@ -589,6 +589,10 @@ VALID_OPTS = {
     # A compound target definition. See: http://docs.saltstack.com/en/latest/topics/targeting/nodegroups.html
     'nodegroups': dict,
 
+    # List-only nodegroups for salt-ssh. Each group must be formed as either a
+    # comma-separated list, or a YAML list.
+    'ssh_list_nodegroups': dict,
+
     # The logfile location for salt-key
     'key_logfile': str,
 
@@ -639,7 +643,7 @@ VALID_OPTS = {
     # The size of key that should be generated when creating new keys
     'keysize': int,
 
-    # The transport system for this deamon. (i.e. zeromq, raet, etc)
+    # The transport system for this daemon. (i.e. zeromq, raet, etc)
     'transport': str,
 
     # FIXME Appears to be unused
@@ -714,8 +718,8 @@ VALID_OPTS = {
     # Instructs the salt CLI to print a summary of a minion reponses before returning
     'cli_summary': bool,
 
-    # The number of minions the master should allow to connect. Can have performance implications
-    # in large setups.
+    # The maximum number of minion connections allowed by the master. Can have performance
+    # implications in large setups.
     'max_minions': int,
 
 
@@ -750,6 +754,9 @@ VALID_OPTS = {
 
     # HTTP request max file content size.
     'http_max_body': int,
+
+    # Delay in seconds before executing bootstrap (salt cloud)
+    'bootstrap_delay': int,
 }
 
 # default configurations
@@ -889,8 +896,8 @@ DEFAULT_MINION_OPTS = {
     'recon_max': 10000,
     'recon_default': 1000,
     'recon_randomize': True,
-    'return_retry_timer': 4,
-    'return_retry_random': True,
+    'return_retry_timer': 5,
+    'return_retry_timer_max': 10,
     'syndic_log_file': os.path.join(salt.syspaths.LOGS_DIR, 'syndic'),
     'syndic_pidfile': os.path.join(salt.syspaths.PIDFILE_DIR, 'salt-syndic.pid'),
     'random_reauth_delay': 10,
@@ -1106,6 +1113,7 @@ DEFAULT_MASTER_OPTS = {
     'search_index_interval': 3600,
     'loop_interval': 60,
     'nodegroups': {},
+    'ssh_list_nodegroups': {},
     'cython_enable': False,
     'enable_gpu_grains': False,
     # XXX: Remove 'key_logfile' support in 2014.1.0
@@ -1133,7 +1141,7 @@ DEFAULT_MASTER_OPTS = {
     'keysize': 2048,
     'transport': 'zeromq',
     'enumerate_proxy_minions': False,
-    'gather_job_timeout': 5,
+    'gather_job_timeout': 10,
     'syndic_event_forward_timeout': 0.5,
     'syndic_max_event_process_time': 0.5,
     'syndic_jid_forward_cache_hwm': 100,
@@ -1194,7 +1202,7 @@ DEFAULT_PROXY_MINION_OPTS = {
     # salt.vt will have trouble with our forking model.
     # Proxies with non-persistent (mostly REST API) connections
     # can change this back to True
-    'multiprocessing': False
+    'multiprocessing': True
 }
 
 # ----- Salt Cloud Configuration Defaults ----------------------------------->
@@ -1220,6 +1228,7 @@ CLOUD_CONFIG_DEFAULTS = {
     'log_fmt_console': _DFLT_LOG_FMT_CONSOLE,
     'log_fmt_logfile': _DFLT_LOG_FMT_LOGFILE,
     'log_granular_levels': {},
+    'bootstrap_delay': None,
 }
 
 DEFAULT_API_OPTS = {
@@ -1267,9 +1276,14 @@ def _validate_file_roots(opts):
                     ' using defaults')
         return {'base': _expand_glob_path([salt.syspaths.BASE_FILE_ROOTS_DIR])}
     for saltenv, dirs in six.iteritems(opts['file_roots']):
+        normalized_saltenv = six.text_type(saltenv)
+        if normalized_saltenv != saltenv:
+            opts['file_roots'][normalized_saltenv] = \
+                opts['file_roots'].pop(saltenv)
         if not isinstance(dirs, (list, tuple)):
-            opts['file_roots'][saltenv] = []
-        opts['file_roots'][saltenv] = _expand_glob_path(opts['file_roots'][saltenv])
+            opts['file_roots'][normalized_saltenv] = []
+        opts['file_roots'][normalized_saltenv] = \
+            _expand_glob_path(opts['file_roots'][normalized_saltenv])
     return opts['file_roots']
 
 
@@ -1497,7 +1511,14 @@ def include_config(include, orig_path, verbose):
 
         for fn_ in sorted(glob.glob(path)):
             log.debug('Including configuration from {0!r}'.format(fn_))
-            salt.utils.dictupdate.update(configuration, _read_conf_file(fn_))
+            opts = _read_conf_file(fn_)
+
+            include = opts.get('include', [])
+            if include:
+                opts.update(include_config(include, fn_, verbose))
+
+            salt.utils.dictupdate.update(configuration, opts)
+
     return configuration
 
 
@@ -2696,6 +2717,8 @@ def apply_minion_config(overrides=None,
     opts['__role'] = 'minion'
     if overrides:
         opts.update(overrides)
+
+    opts['__cli'] = os.path.basename(sys.argv[0])
 
     if len(opts['sock_dir']) > len(opts['cachedir']) + 10:
         opts['sock_dir'] = os.path.join(opts['cachedir'], '.salt-unix')

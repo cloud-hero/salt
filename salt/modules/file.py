@@ -29,6 +29,7 @@ import tempfile
 import time
 import glob
 import hashlib
+import mmap
 from functools import reduce  # pylint: disable=redefined-builtin
 from collections import Iterable, Mapping
 
@@ -1631,7 +1632,7 @@ def replace(path,
             pattern,
             repl,
             count=0,
-            flags=0,
+            flags=8,
             bufsize=1,
             append_if_not_found=False,
             prepend_if_not_found=False,
@@ -1665,14 +1666,14 @@ def replace(path,
         A list of flags defined in the :ref:`re module documentation
         <contents-of-module-re>`. Each list item should be a string that will
         correlate to the human-friendly flag name. E.g., ``['IGNORECASE',
-        'MULTILINE']``. Note: multiline searches must specify ``file`` as the
-        ``bufsize`` argument below.
+        'MULTILINE']``. Optionally, ``flags`` may be an int, with a value
+        corresponding to the XOR (``|``) of all the desired flags. Defaults to
+        8 (which supports 'MULTILINE').
     bufsize (int or str)
         How much of the file to buffer into memory at once. The
         default value ``1`` processes one line at a time. The special value
         ``file`` may be specified which will read the entire file into memory
-        before processing. Note: multiline searches must specify ``file``
-        buffering.
+        before processing.
     append_if_not_found
         .. versionadded:: 2014.7.0
 
@@ -1773,8 +1774,9 @@ def replace(path,
 
     flags_num = _get_flags(flags)
     cpattern = re.compile(str(pattern), flags_num)
+    filesize = os.path.getsize(path)
     if bufsize == 'file':
-        bufsize = os.path.getsize(path)
+        bufsize = filesize
 
     # Search the file; track if any changes have been made for the return val
     has_changes = False
@@ -1795,55 +1797,58 @@ def replace(path,
                                         append_if_not_found) \
                                      else repl
 
-    if search_only:
+    # mmap throws a ValueError if the file is empty, but if it is empty we
+    # should be able to skip the search anyway. NOTE: Is there a use case for
+    # searching an empty file with an empty pattern?
+    if filesize is not 0:
+        # First check the whole file, determine whether to make the replacement
+        # Searching first avoids modifying the time stamp if there are no changes
+        r_data = None
         try:
-            # allow multiline searching
-            with salt.utils.filebuffer.BufferedReader(path) as breader:
-                for chunk in breader:
-                    if re.search(cpattern, chunk):
-                        return True
-                return False
+            # Use a read-only handle to open the file
+            with salt.utils.fopen(path,
+                                  mode='rb',
+                                  buffering=bufsize) as r_file:
+                r_data = mmap.mmap(r_file.fileno(),
+                                   0,
+                                   access=mmap.ACCESS_READ)
+                if search_only:
+                    # Just search; bail as early as a match is found
+                    if re.search(cpattern, r_data):
+                        return True  # `with` block handles file closure
+                else:
+                    result, nrepl = re.subn(cpattern, repl, r_data, count)
+
+                    # found anything? (even if no change)
+                    if nrepl > 0:
+                        found = True
+                        # Identity check the potential change
+                        has_changes = True if pattern != repl else has_changes
+
+                    if prepend_if_not_found or append_if_not_found:
+                        # Search for content, to avoid pre/appending the
+                        # content if it was pre/appended in a previous run.
+                        if re.search('^{0}$'.format(re.escape(content)),
+                                     r_data,
+                                     flags=flags_num):
+                            # Content was found, so set found.
+                            found = True
+
+                    # Keep track of show_changes here, in case the file isn't
+                    # modified
+                    if show_changes or append_if_not_found or \
+                       prepend_if_not_found:
+                        orig_file = r_data.read(filesize).splitlines(True)
+                        new_file = result.splitlines(True)
+
         except (OSError, IOError) as exc:
             raise CommandExecutionError(
-                "Unable to read file '{0}'. Exception: {1}".format(path, exc)
+                "Unable to open file '{0}'. "
+                "Exception: {1}".format(path, exc)
                 )
-
-    # First check the whole file, determine whether to make the replacement
-    # Searching first avoids modifying the time stamp if there are no changes
-    try:
-        # Use a read-only handle to open the file
-        with salt.utils.fopen(path,
-                              mode='r',
-                              buffering=bufsize) as r_file:
-            for line in r_file:
-                result, nrepl = re.subn(cpattern, repl, line, count)
-
-                # found anything? (even if no change)
-                if nrepl > 0:
-                    found = True
-
-                if prepend_if_not_found or append_if_not_found:
-                    # Search for content, so we don't continue pre/appending
-                    # the content if it's been pre/appended in a previous run.
-                    if re.search('^{0}$'.format(re.escape(content)), line):
-                        # Content was found, so set found.
-                        found = True
-
-                # Identity check each potential change until one change is made
-                if has_changes is False and result != line:
-                    has_changes = True
-
-                # Keep track of show_changes here, in case the file isn't
-                # modified
-                if show_changes or append_if_not_found or \
-                   prepend_if_not_found:
-                    orig_file.append(line)
-                    new_file.append(result)
-
-    except (OSError, IOError) as exc:
-        raise CommandExecutionError(
-            "Unable to open file '{0}'. Exception: {1}".format(path, exc)
-            )
+        finally:
+            if r_data and isinstance(r_data, mmap.mmap):
+                r_data.close()
 
     if has_changes and not dry_run:
         # Write the replacement text in this block.
@@ -1854,6 +1859,7 @@ def replace(path,
         except (OSError, IOError) as exc:
             raise CommandExecutionError("Exception: {0}".format(exc))
 
+        r_data = None
         try:
             # Open the file in write mode
             with salt.utils.fopen(path,
@@ -1864,20 +1870,25 @@ def replace(path,
                     with salt.utils.fopen(temp_file,
                                           mode='r',
                                           buffering=bufsize) as r_file:
-                        for line in r_file:
-                            result, nrepl = re.subn(cpattern, repl,
-                                                    line, count)
-                            try:
-                                w_file.write(result)
-                            except (OSError, IOError) as exc:
-                                raise CommandExecutionError(
-                                    "Unable to write file '{0}'. Contents may "
-                                    "be truncated. Temporary file contains copy "
-                                    "at '{1}'. "
-                                    "Exception: {2}".format(path, temp_file, exc)
-                                    )
+                        r_data = mmap.mmap(r_file.fileno(),
+                                           0,
+                                           access=mmap.ACCESS_READ)
+                        result, nrepl = re.subn(cpattern, repl,
+                                                r_data, count)
+                        try:
+                            w_file.write(result)
+                        except (OSError, IOError) as exc:
+                            raise CommandExecutionError(
+                                "Unable to write file '{0}'. Contents may "
+                                "be truncated. Temporary file contains copy "
+                                "at '{1}'. "
+                                "Exception: {2}".format(path, temp_file, exc)
+                                )
                 except (OSError, IOError) as exc:
                     raise CommandExecutionError("Exception: {0}".format(exc))
+                finally:
+                    if r_data and isinstance(r_data, mmap.mmap):
+                        r_data.close()
         except (OSError, IOError) as exc:
             raise CommandExecutionError("Exception: {0}".format(exc))
 
@@ -2162,7 +2173,7 @@ def blockreplace(path,
 
 def search(path,
         pattern,
-        flags=0,
+        flags=8,
         bufsize=1,
         ignore_if_missing=False,
         multiline=False
@@ -3219,11 +3230,13 @@ def source_list(source, source_hash, saltenv):
             if isinstance(single, dict):
                 # check the proto, if it is http or ftp then download the file
                 # to check, if it is salt then check the master list
+                # if it is a local file, check if the file exists
                 if len(single) != 1:
                     continue
                 single_src = next(iter(single))
                 single_hash = single[single_src] if single[single_src] else source_hash
-                proto = _urlparse(single_src).scheme
+                urlparsed_single_src = _urlparse(single_src)
+                proto = urlparsed_single_src.scheme
                 if proto == 'salt':
                     path, senv = salt.utils.url.parse(single_src)
                     if not senv:
@@ -3238,11 +3251,24 @@ def source_list(source, source_hash, saltenv):
                     if fn_:
                         ret = (single_src, single_hash)
                         break
+                elif proto == 'file' and os.path.exists(urlparsed_single_src.path):
+                    ret = (single_src, single_hash)
+                    break
+                elif single_src.startswith('/') and os.path.exists(single_src):
+                    ret = (single_src, single_hash)
+                    break
             elif isinstance(single, six.string_types):
                 path, senv = salt.utils.url.parse(single)
                 if not senv:
                     senv = saltenv
                 if (path, senv) in mfiles or (path, senv) in mdirs:
+                    ret = (single, source_hash)
+                    break
+                urlparsed_source = _urlparse(single)
+                if urlparsed_source.scheme == 'file' and os.path.exists(urlparsed_source.path):
+                    ret = (single, source_hash)
+                    break
+                if single.startswith('/') and os.path.exists(single):
                     ret = (single, source_hash)
                     break
         if ret is None:
@@ -4700,7 +4726,7 @@ def list_backups(path, limit=None):
         [files[x] for x in sorted(files, reverse=True)[:limit]]
     )))
 
-list_backup = list_backups
+list_backup = salt.utils.alias_function(list_backups, 'list_backup')
 
 
 def list_backups_dir(path, limit=None):
@@ -4872,7 +4898,7 @@ def delete_backup(path, backup_id):
 
     return ret
 
-remove_backup = delete_backup
+remove_backup = salt.utils.alias_function(delete_backup, 'remove_backup')
 
 
 def grep(path,

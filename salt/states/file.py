@@ -252,6 +252,7 @@ import salt.payload
 import salt.utils
 import salt.utils.templates
 import salt.utils.url
+from salt.utils.locales import sdecode
 from salt.exceptions import CommandExecutionError
 from salt.serializers import yaml as yaml_serializer
 from salt.serializers import json as json_serializer
@@ -1108,7 +1109,9 @@ def managed(name,
 
         A list of sources can also be passed in to provide a default source and
         a set of fallbacks. The first source in the list that is found to exist
-        will be used and subsequent entries in the list will be ignored.
+        will be used and subsequent entries in the list will be ignored. Source
+        list functionality only supports local files and remote files hosted on
+        the salt master server or retrievable via HTTP, HTTPS, or FTP.
 
         .. code-block:: yaml
 
@@ -1649,18 +1652,6 @@ def directory(name,
                     - user
                     - group
                     - mode
-                    - ignore_files
-
-            /var/log/httpd:
-                file.directory:
-                - user: root
-                - group: root
-                - dir_mode: 755
-                - file_mode: 644
-                - recurse:
-                    - user
-                    - group
-                    - mode
                     - ignore_dirs
 
         .. versionadded:: 2015.5.0
@@ -2094,7 +2085,7 @@ def recurse(name,
         recursively removed so that symlink creation can proceed. This
         option is usually not needed except in special circumstances.
     '''
-    name = os.path.expanduser(name)
+    name = os.path.expanduser(sdecode(name))
 
     user = _test_owner(kwargs, user=user)
     if salt.utils.is_windows():
@@ -2331,7 +2322,7 @@ def recurse(name,
         # the file to copy from; it is either a normal file or an
         # empty dir(if include_empty==true).
 
-        relname = os.path.relpath(fn_, srcpath)
+        relname = sdecode(os.path.relpath(fn_, srcpath))
         if relname.startswith('..'):
             continue
 
@@ -2465,7 +2456,7 @@ def replace(name,
             pattern,
             repl,
             count=0,
-            flags=0,
+            flags=8,
             bufsize=1,
             append_if_not_found=False,
             prepend_if_not_found=False,
@@ -2492,16 +2483,18 @@ def replace(name,
         replaced, otherwise all occurrences will be replaced.
 
     flags
-        A list of flags defined in the :ref:`re module documentation <contents-of-module-re>`.
-        Each list item should be a string that will correlate to the human-friendly flag name.
-        E.g., ``['IGNORECASE', 'MULTILINE']``. Note: multiline searches must specify ``file``
-        as the ``bufsize`` argument below. Defaults to 0 and can be a list or an int.
+        A list of flags defined in the :ref:`re module documentation
+        <contents-of-module-re>`. Each list item should be a string that will
+        correlate to the human-friendly flag name. E.g., ``['IGNORECASE',
+        'MULTILINE']``. Optionally, ``flags`` may be an int, with a value
+        corresponding to the XOR (``|``) of all the desired flags. Defaults to
+        8 (which supports 'MULTILINE').
 
     bufsize
-        How much of the file to buffer into memory at once. The default value ``1`` processes
-        one line at a time. The special value ``file`` may be specified which will read the
-        entire file into memory before processing. Note: multiline searches must specify ``file``
-        buffering. Can be an int or a str.
+        How much of the file to buffer into memory at once. The default value
+        ``1`` processes one line at a time. The special value ``file`` may be
+        specified which will read the entire file into memory before
+        processing.
 
     append_if_not_found
         If pattern is not found and set to ``True`` then, the content will be appended to the file.
@@ -3520,7 +3513,7 @@ def patch(name,
         using this state function.
 
     name
-        The file to with the patch will be applied.
+        The file to which the patch will be applied.
 
     source
         The source patch to download to the minion, this source file must be
@@ -3726,7 +3719,7 @@ def copy(
         .. versionadded:: 2015.5.0
 
         Set ``preserve: True`` to preserve user/group ownership and mode
-        after copying. Default is ``False``. If ``preseve`` is set to ``True``,
+        after copying. Default is ``False``. If ``preserve`` is set to ``True``,
         then user/group/mode attributes will be ignored.
 
     user
@@ -4310,6 +4303,8 @@ def serialize(name,
                 'result': False
                 }
 
+    contents += '\n'
+
     if __opts__['test']:
         ret['changes'] = __salt__['file.check_managed_changes'](
             name=name,
@@ -4579,10 +4574,18 @@ def mod_run_check_cmd(cmd, filename, **check_cmd_opts):
 
     log.debug('running our check_cmd')
     _cmd = '{0} {1}'.format(cmd, filename)
-    if __salt__['cmd.retcode'](_cmd, **check_cmd_opts) != 0:
-        return {'comment': 'check_cmd execution failed',
-                'skip_watch': True,
-                'result': False}
+    cret = __salt__['cmd.run_all'](_cmd, **check_cmd_opts)
+    if cret['retcode'] != 0:
+        ret = {'comment': 'check_cmd execution failed',
+               'skip_watch': True,
+               'result': False}
+
+        if cret.get('stdout'):
+            ret['comment'] += '\n' + cret['stdout']
+        if cret.get('stderr'):
+            ret['comment'] += '\n' + cret['stderr']
+
+        return ret
 
     # No reason to stop, return True
     return True

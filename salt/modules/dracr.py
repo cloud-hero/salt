@@ -17,8 +17,17 @@ import salt.utils
 # Import 3rd-party libs
 import salt.ext.six as six
 from salt.ext.six.moves import range  # pylint: disable=import-error,no-name-in-module,redefined-builtin
+from salt.ext.six.moves import map
 
 log = logging.getLogger(__name__)
+
+try:
+    run_all = __salt__['cmd.run_all']
+except NameError:
+    import salt.modules.cmdmod
+    __salt__ = {
+        'cmd.run_all': salt.modules.cmdmod._run_all_quiet
+    }
 
 
 def __virtual__():
@@ -36,15 +45,18 @@ def __parse_drac(output):
     section = ''
 
     for i in output.splitlines():
+        if i.strip().endswith(':') and '=' not in i:
+            section = i[0:-1]
+            drac[section] = {}
         if len(i.rstrip()) > 0 and '=' in i:
             if section in drac:
                 drac[section].update(dict(
                     [[prop.strip() for prop in i.split('=')]]
                 ))
-        else:
-            section = i.strip()[:-1]
-            if section not in drac and section:
-                drac[section] = {}
+            else:
+                section = i.strip()
+                if section not in drac and section:
+                    drac[section] = {}
 
     return drac
 
@@ -124,9 +136,32 @@ def __execute_ret(command, host=None,
             if len(l.strip()) == 0:
                 continue
             fmtlines.append(l)
+            if '=' in l:
+                continue
         cmd['stdout'] = '\n'.join(fmtlines)
 
     return cmd
+
+
+def get_dns_dracname(host=None,
+                     admin_username=None, admin_password=None):
+
+    ret = __execute_ret('get iDRAC.NIC.DNSRacName', host=host,
+                        admin_username=admin_username,
+                        admin_password=admin_password)
+    parsed = __parse_drac(ret['stdout'])
+    return parsed
+
+
+def set_dns_dracname(name,
+                     host=None,
+                     admin_username=None, admin_password=None):
+
+    ret = __execute_ret('set iDRAC.NIC.DNSRacName {0}'.format(name),
+                        host=host,
+                        admin_username=admin_username,
+                        admin_password=admin_password)
+    return ret
 
 
 def system_info(host=None,
@@ -208,6 +243,12 @@ def network_info(host=None,
 
     inv = inventory(host=host, admin_username=admin_username,
                     admin_password=admin_password)
+    if inv is None:
+        cmd = {}
+        cmd['retcode'] = -1
+        cmd['stdout'] = 'Problem getting switch inventory'
+        return cmd
+
     if module not in inv.get('switch'):
         cmd = {}
         cmd['retcode'] = -1
@@ -644,6 +685,41 @@ def set_network(ip, netmask, gateway, host=None,
     ))
 
 
+def server_power(status, host=None,
+                  admin_username=None,
+                  admin_password=None,
+                  module=None):
+    '''
+    status
+        One of 'powerup', 'powerdown', 'powercycle', 'hardreset',
+        'graceshutdown'
+
+    host
+        The chassis host.
+
+    admin_username
+        The username used to access the chassis.
+
+    admin_password
+        The password used to access the chassis.
+
+    module
+        The element to reboot on the chassis such as a blade. If not provided,
+        the chassis will be rebooted.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt dell dracr.server_reboot
+        salt dell dracr.server_reboot module=server-1
+
+    '''
+    return __execute_cmd('serveraction {0}'.format(status),
+                         host=host, admin_username=admin_username,
+                         admin_password=admin_password, module=module)
+
+
 def server_reboot(host=None,
                   admin_username=None,
                   admin_password=None,
@@ -914,7 +990,10 @@ def get_slotname(slot, host=None, admin_username=None, admin_password=None):
     '''
     slots = list_slotnames(host=host, admin_username=admin_username,
                            admin_password=admin_password)
-    return slots[slot]
+    # The keys for this dictionary are strings, not integers, so convert the
+    # argument to a string
+    slot = str(slot)
+    return slots[slot]['slotname']
 
 
 def set_slotname(slot, name, host=None,
@@ -945,10 +1024,9 @@ def set_slotname(slot, name, host=None,
             admin_username=root admin_password=secret
 
     '''
-    return __execute_cmd('setslotname -i {0} {1}'.format(
-        slot, name[0:14], host=host,
-        admin_username=admin_username,
-        admin_password=admin_password))
+    return __execute_cmd('config -g cfgServerInfo -o cfgServerName -i {0} {1}'.format(slot, name),
+                         host=host, admin_username=admin_username,
+                         admin_password=admin_password)
 
 
 def set_chassis_name(name,
@@ -1004,9 +1082,9 @@ def get_chassis_name(host=None, admin_username=None, admin_password=None):
             admin_username=root admin_password=secret
 
     '''
-    return system_info(host=host, admin_username=admin_username,
-                       admin_password=
-                       admin_password)['Chassis Information']['Chassis Name']
+    return bare_rac_cmd('getchassisname', host=host,
+                        admin_username=admin_username,
+                        admin_password=admin_password)
 
 
 def inventory(host=None, admin_username=None, admin_password=None):
@@ -1147,8 +1225,66 @@ def get_chassis_location(host=None,
     '''
     return system_info(host=host,
                        admin_username=admin_username,
-                       admin_password=admin_password)['Chassis Information']\
-                                                     ['Chassis Location']
+                       admin_password=admin_password)['Chassis Information']['Chassis Location']
+
+
+def set_chassis_datacenter(location,
+                         host=None,
+                         admin_username=None,
+                         admin_password=None):
+    '''
+    Set the location of the chassis.
+
+    location
+        The name of the datacenter to be set on the chassis.
+
+    host
+        The chassis host.
+
+    admin_username
+        The username used to access the chassis.
+
+    admin_password
+        The password used to access the chassis.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' dracr.set_chassis_datacenter datacenter-name host=111.222.333.444
+            admin_username=root admin_password=secret
+
+    '''
+    return set_general('cfgLocation', 'cfgLocationDatacenter', location,
+                         host=host, admin_username=admin_username,
+                         admin_password=admin_password)
+
+
+def get_chassis_datacenter(host=None,
+                         admin_username=None,
+                         admin_password=None):
+    '''
+    Get the datacenter of the chassis.
+
+    host
+        The chassis host.
+
+    admin_username
+        The username used to access the chassis.
+
+    admin_password
+        The password used to access the chassis.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' dracr.set_chassis_location host=111.222.333.444
+           admin_username=root admin_password=secret
+
+    '''
+    return get_general('cfgLocation', 'cfgLocationDatacenter', host=host,
+                       admin_username=admin_username, admin_password=admin_password)
 
 
 def set_general(cfg_sec, cfg_var, val, host=None,
@@ -1163,6 +1299,19 @@ def set_general(cfg_sec, cfg_var, val, host=None,
 def get_general(cfg_sec, cfg_var, host=None,
                 admin_username=None, admin_password=None):
     ret = __execute_ret('getconfig -g {0} -o {1}'.format(cfg_sec, cfg_var),
+                        host=host,
+                        admin_username=admin_username,
+                        admin_password=admin_password)
+
+    if ret['retcode'] == 0:
+        return ret['stdout']
+    else:
+        return ret
+
+
+def bare_rac_cmd(cmd, host=None,
+                admin_username=None, admin_password=None):
+    ret = __execute_ret('{0}'.format(cmd),
                         host=host,
                         admin_username=admin_username,
                         admin_password=admin_password)

@@ -10,6 +10,7 @@ import logging
 import hashlib
 import os
 import shutil
+import ftplib
 
 # Import salt libs
 from salt.exceptions import (
@@ -27,6 +28,8 @@ import salt.utils.templates
 import salt.utils.url
 import salt.utils.gzip_util
 import salt.utils.http
+import salt.utils.s3
+from salt.utils.locales import sdecode
 from salt.utils.openstack.swift import SaltSwift
 
 # pylint: disable=no-name-in-module,import-error
@@ -212,8 +215,7 @@ class Client(object):
 
         ret = []
 
-        path = salt.utils.locales.sdecode(path)
-        path = self._check_proto(path)
+        path = self._check_proto(sdecode(path))
         # We want to make sure files start with this *directory*, use
         # '/' explicitly because the master (that's generating the
         # list of files) only runs on POSIX
@@ -228,7 +230,6 @@ class Client(object):
         # go through the list of all files finding ones that are in
         # the target directory and caching them
         for fn_ in self.file_list(saltenv):
-            fn_ = salt.utils.locales.sdecode(fn_)
             if fn_.strip() and fn_.startswith(path):
                 if salt.utils.check_include_exclude(
                         fn_, include_pat, exclude_pat):
@@ -572,6 +573,15 @@ class Client(object):
                 return dest
             except Exception:
                 raise MinionError('Could not fetch from {0}'.format(url))
+        if url_data.scheme == 'ftp':
+            try:
+                ftp = ftplib.FTP(url_data.hostname)
+                ftp.login()
+                with salt.utils.fopen(dest, 'wb') as fp_:
+                    ftp.retrbinary('RETR {0}'.format(url_data.path), fp_.write)
+                return dest
+            except Exception as exc:
+                raise MinionError('Could not retrieve {0} from FTP server. Exception: {1}'.format(url, exc))
 
         if url_data.scheme == 'swift':
             try:
@@ -609,11 +619,11 @@ class Client(object):
             if 'handle' not in query:
                 raise MinionError('Error: {0}'.format(query['error']))
             if no_cache:
-                return query['text']
+                return query['body']
             else:
                 dest_tmp = "{0}.part".format(dest)
                 with salt.utils.fopen(dest_tmp, 'wb') as destfp:
-                    destfp.write(query['text'])
+                    destfp.write(query['body'])
                 salt.utils.files.rename(dest_tmp, dest)
                 return dest
         except HTTPError as exc:
@@ -784,12 +794,8 @@ class LocalClient(Client):
                 os.path.join(path, prefix), followlinks=True
             ):
                 for fname in files:
-                    ret.append(
-                        os.path.relpath(
-                            os.path.join(root, fname),
-                            path
-                        )
-                    )
+                    relpath = os.path.relpath(os.path.join(root, fname), path)
+                    ret.append(sdecode(relpath))
         return ret
 
     def file_list_emptydirs(self, saltenv='base', prefix='', env=None):
@@ -816,7 +822,7 @@ class LocalClient(Client):
                 os.path.join(path, prefix), followlinks=True
             ):
                 if len(dirs) == 0 and len(files) == 0:
-                    ret.append(os.path.relpath(root, path))
+                    ret.append(sdecode(os.path.relpath(root, path)))
         return ret
 
     def dir_list(self, saltenv='base', prefix='', env=None):
@@ -842,7 +848,7 @@ class LocalClient(Client):
             for root, dirs, files in os.walk(
                 os.path.join(path, prefix), followlinks=True
             ):
-                ret.append(os.path.relpath(root, path))
+                ret.append(sdecode(os.path.relpath(root, path)))
         return ret
 
     def hash_file(self, path, saltenv='base', env=None):

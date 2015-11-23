@@ -37,11 +37,12 @@ from salt.utils import immutabletypes
 from salt.template import compile_template, compile_template_str
 from salt.exceptions import SaltRenderError, SaltReqTimeoutError, SaltException
 from salt.utils.odict import OrderedDict, DefaultOrderedDict
+from salt.utils.locales import sdecode
 
 # Import third party libs
 # pylint: disable=import-error,no-name-in-module,redefined-builtin
 import salt.ext.six as six
-from salt.ext.six.moves import range
+from salt.ext.six.moves import map, range
 # pylint: enable=import-error,no-name-in-module,redefined-builtin
 
 log = logging.getLogger(__name__)
@@ -494,6 +495,7 @@ class Compiler(object):
                 chunk['order'] = chunk['order'] + chunk.pop('name_order') / 10000.0
             if chunk['order'] < 0:
                 chunk['order'] = cap + 1000000 + chunk['order']
+            chunk['name'] = sdecode(chunk['name'])
         chunks.sort(key=lambda chunk: (chunk['order'], '{0[state]}{0[name]}{0[fun]}'.format(chunk)))
         return chunks
 
@@ -536,7 +538,7 @@ class Compiler(object):
                         if isinstance(entry, dict):
                             low_name = next(six.iterkeys(entry))
                             live['name'] = low_name
-                            live.update(entry[low_name][0])
+                            list(map(live.update, entry[low_name]))
                         else:
                             live['name'] = entry
                         live['name_order'] = name_order
@@ -650,7 +652,7 @@ class State(object):
         Execute the aggregation systems to runtime modify the low chunk
         '''
         agg_opt = self.functions['config.option']('state_aggregate')
-        if low.get('aggregate') is True:
+        if 'aggregate' in low:
             agg_opt = low['aggregate']
         if agg_opt is True:
             agg_opt = [low['state']]
@@ -1167,7 +1169,7 @@ class State(object):
                         if isinstance(entry, dict):
                             low_name = next(six.iterkeys(entry))
                             live['name'] = low_name
-                            live.update(entry[low_name][0])
+                            list(map(live.update, entry[low_name]))
                         else:
                             live['name'] = entry
                         live['name_order'] = name_order

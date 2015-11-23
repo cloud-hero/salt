@@ -94,6 +94,7 @@ def _sync(form, saltenv=None):
     remote = set()
     source = salt.utils.url.create('_' + form)
     mod_dir = os.path.join(__opts__['extension_modules'], '{0}'.format(form))
+    cumask = os.umask(0o77)
     if not os.path.isdir(mod_dir):
         log.info('Creating module dir {0!r}'.format(mod_dir))
         try:
@@ -168,6 +169,7 @@ def _sync(form, saltenv=None):
             os.remove(os.path.join(__opts__['cachedir'], 'grains.cache.p'))
         except OSError:
             log.error('Could not remove grains cache!')
+    os.umask(cumask)
     return ret
 
 
@@ -272,6 +274,25 @@ def sync_beacons(saltenv=None, refresh=True):
     ret = _sync('beacons', saltenv)
     if refresh:
         refresh_beacons()
+    return ret
+
+
+def sync_sdb(saltenv=None, refresh=False):
+    '''
+    Sync sdb modules from the _sdb directory on the salt master file
+    server. This function is environment aware, pass the desired environment
+    to grab the contents of the _sdb directory, base is the default
+    environment.
+
+    .. versionadded:: 2015.5.7
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' saltutil.sync_sdb
+    '''
+    ret = _sync('sdb', saltenv)
     return ret
 
 
@@ -427,7 +448,7 @@ def sync_output(saltenv=None, refresh=True):
         refresh_modules()
     return ret
 
-sync_outputters = sync_output
+sync_outputters = salt.utils.alias_function(sync_output, 'sync_outputters')
 
 
 def sync_utils(saltenv=None, refresh=True):
@@ -507,12 +528,14 @@ def sync_all(saltenv=None, refresh=True):
     ret['beacons'] = sync_beacons(saltenv, False)
     ret['modules'] = sync_modules(saltenv, False)
     ret['states'] = sync_states(saltenv, False)
+    ret['sdb'] = sync_sdb(saltenv, False)
     ret['grains'] = sync_grains(saltenv, False)
     ret['renderers'] = sync_renderers(saltenv, False)
     ret['returners'] = sync_returners(saltenv, False)
     ret['output'] = sync_output(saltenv, False)
     ret['utils'] = sync_utils(saltenv, False)
     ret['log_handlers'] = sync_log_handlers(saltenv, False)
+    ret['proxymodules'] = sync_proxymodules(saltenv, False)
     if refresh:
         refresh_modules()
     return ret
@@ -553,7 +576,7 @@ def refresh_pillar():
         ret = False  # Effectively a no-op, since we can't really return without an event system
     return ret
 
-pillar_refresh = refresh_pillar
+pillar_refresh = salt.utils.alias_function(refresh_pillar, 'pillar_refresh')
 
 
 def refresh_modules(async=True):

@@ -261,6 +261,9 @@ def build_rule(table='filter', chain=None, command=None, position='', full=None,
             del kwargs[multiport_arg]
 
     if 'comment' in kwargs:
+        if '-m comment' not in rule:
+            rule.append('-m comment')
+
         rule.append('--comment "{0}"'.format(kwargs['comment']))
         del kwargs['comment']
 
@@ -478,7 +481,7 @@ def get_saved_rules(conf_file=None, family='ipv4'):
         IPv6:
         salt '*' iptables.get_saved_rules family=ipv6
     '''
-    return _parse_conf(conf_file, family)
+    return _parse_conf(conf_file=conf_file, family=family)
 
 
 def get_rules(family='ipv4'):
