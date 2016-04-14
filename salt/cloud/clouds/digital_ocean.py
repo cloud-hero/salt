@@ -616,7 +616,7 @@ def import_keypair(kwargs=None, call=None):
         file(mandatory): public key file-name
         keyname(mandatory): public key name in the provider
     '''
-    with open(kwargs['file'], 'r') as public_key_filename:
+    with salt.utils.fopen(kwargs['file'], 'r') as public_key_filename:
         public_key_content = public_key_filename.read()
 
     digital_ocean_kwargs = {
