@@ -5,7 +5,7 @@ Connection module for Amazon ELB
 .. versionadded:: 2014.7.0
 
 :configuration: This module accepts explicit elb credentials but can also utilize
-    IAM roles assigned to the instance trough Instance Profiles. Dynamic
+    IAM roles assigned to the instance through Instance Profiles. Dynamic
     credentials are then automatically obtained from AWS API and no further
     configuration is necessary. More Information available at:
 
@@ -42,21 +42,26 @@ Connection module for Amazon ELB
 :depends: boto >= 2.33.0
 '''
 # keep lint from choking on _get_conn and _cache_id
-#pylint: disable=E0602
+# pylint: disable=E0602
 
 from __future__ import absolute_import
 
 # Import Python libs
 import logging
-from distutils.version import LooseVersion as _LooseVersion  # pylint: disable=import-error,no-name-in-module
 import json
-import salt.ext.six as six
 
 log = logging.getLogger(__name__)
 
+# Import Salt libs
+import salt.utils.odict as odict
+from salt.utils.versions import LooseVersion as _LooseVersion
+
 # Import third party libs
+import salt.ext.six as six
+from salt.ext.six import string_types
 try:
     import boto
+    import boto.ec2  # pylint: enable=unused-import
     # connection settings were added in 2.33.0
     required_boto_version = '2.33.0'
     if (_LooseVersion(boto.__version__) <
@@ -64,7 +69,6 @@ try:
         msg = 'boto_elb requires boto {0}.'.format(required_boto_version)
         logging.debug(msg)
         raise ImportError()
-    import boto.ec2
     from boto.ec2.elb import HealthCheck
     from boto.ec2.elb.attributes import AccessLogAttribute
     from boto.ec2.elb.attributes import ConnectionDrainingAttribute
@@ -75,18 +79,14 @@ try:
 except ImportError:
     HAS_BOTO = False
 
-# Import Salt libs
-from salt.ext.six import string_types
-import salt.utils.odict as odict
-
 
 def __virtual__():
     '''
     Only load if boto libraries exist.
     '''
     if not HAS_BOTO:
-        return False
-    __utils__['boto.assign_funcs'](__name__, 'elb', module='ec2.elb')
+        return (False, "The boto_elb module cannot be loaded: boto library not found")
+    __utils__['boto.assign_funcs'](__name__, 'elb', module='ec2.elb', pack=__salt__)
     return True
 
 
@@ -111,13 +111,47 @@ def exists(name, region=None, key=None, keyid=None, profile=None):
             log.debug(msg)
             return False
     except boto.exception.BotoServerError as error:
-        log.debug(error)
+        log.warning(error)
         return False
+
+
+def get_all_elbs(region=None, key=None, keyid=None, profile=None):
+    '''
+    Return all load balancers associated with an account
+
+    CLI example:
+
+    .. code-block:: bash
+
+        salt myminion boto_elb.get_all_elbs region=us-east-1
+    '''
+    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
+
+    try:
+        return [e for e in conn.get_all_load_balancers()]
+    except boto.exception.BotoServerError as error:
+        log.warning(error)
+        return []
+
+
+def list_elbs(region=None, key=None, keyid=None, profile=None):
+    '''
+    Return names of all load balancers associated with an account
+
+    CLI example:
+
+    .. code-block:: bash
+
+        salt myminion boto_elb.list_elbs region=us-east-1
+    '''
+
+    return [e.name for e in get_all_elbs(region=region, key=key, keyid=keyid,
+                                         profile=profile)]
 
 
 def get_elb_config(name, region=None, key=None, keyid=None, profile=None):
     '''
-    Check to see if an ELB exists.
+    Get an ELB configuration.
 
     CLI example:
 
@@ -144,6 +178,13 @@ def get_elb_config(name, region=None, key=None, keyid=None, profile=None):
                 listener_dict['certificate'] = _listener.ssl_certificate_id
             listeners.append(listener_dict)
         ret['listeners'] = listeners
+        backends = []
+        for _backend in lb.backends:
+            bs_dict = {}
+            bs_dict['instance_port'] = _backend.instance_port
+            bs_dict['policies'] = [p.policy_name for p in _backend.policies]
+            backends.append(bs_dict)
+        ret['backends'] = backends
         ret['subnets'] = lb.subnets
         ret['security_groups'] = lb.security_groups
         ret['scheme'] = lb.scheme
@@ -161,7 +202,7 @@ def get_elb_config(name, region=None, key=None, keyid=None, profile=None):
         return ret
     except boto.exception.BotoServerError as error:
         log.debug(error)
-        return []
+        return {}
 
 
 def listener_dict_to_tuple(listener):
@@ -212,10 +253,11 @@ def create(name, availability_zones, listeners, subnets=None,
     _complex_listeners = []
     for listener in listeners:
         _complex_listeners.append(listener_dict_to_tuple(listener))
+
     try:
-        lb = conn.create_load_balancer(name, availability_zones, [],
-                                       subnets, security_groups, scheme,
-                                       _complex_listeners)
+        lb = conn.create_load_balancer(name=name, zones=availability_zones, subnets=subnets,
+                                       security_groups=security_groups, scheme=scheme,
+                                       complex_listeners=_complex_listeners)
         if lb:
             log.info('Created ELB {0}'.format(name))
             return True
@@ -225,7 +267,7 @@ def create(name, availability_zones, listeners, subnets=None,
             return False
     except boto.exception.BotoServerError as error:
         log.debug(error)
-        msg = 'Failed to create ELB {0}: {1}'.format(name, error)
+        msg = 'Failed to create ELB {0}: {1}: {2}'.format(name, error.error_code, error.message)
         log.error(msg)
         return False
 
@@ -493,6 +535,37 @@ def set_attributes(name, attributes, region=None, key=None, keyid=None,
     '''
     Set attributes on an ELB.
 
+    name (string)
+        Name of the ELB instance to set attributes for
+
+    attributes
+        A dict of attributes to set.
+
+        Valid attributes are:
+
+        access_log (dict)
+            enabled (bool)
+                Enable storage of access logs.
+            s3_bucket_name (string)
+                The name of the S3 bucket to place logs.
+            s3_bucket_prefix (string)
+                Prefix for the log file name.
+            emit_interval (int)
+                Interval for storing logs in S3 in minutes. Valid values are
+                5 and 60.
+
+        connection_draining (dict)
+            enabled (bool)
+                Enable connection draining.
+            timeout (int)
+                Maximum allowed time in seconds for sending existing
+                connections to an instance that is deregistering or unhealthy.
+                Default is 300.
+
+        cross_zone_load_balancing (dict)
+            enabled (bool)
+                Enable cross-zone load balancing.
+
     CLI example to set attributes on an ELB:
 
     .. code-block:: bash
@@ -640,7 +713,7 @@ def register_instances(name, instances, region=None, key=None, keyid=None,
     try:
         registered_instances = conn.register_instances(name, instances)
     except boto.exception.BotoServerError as error:
-        log.warn(error)
+        log.warning(error)
         return False
     registered_instance_ids = [instance.id for instance in
                                registered_instances]
@@ -648,7 +721,7 @@ def register_instances(name, instances, region=None, key=None, keyid=None,
     # able to be registered with the given ELB
     register_failures = set(instances).difference(set(registered_instance_ids))
     if register_failures:
-        log.warn('Instance(s): {0} not registered with ELB {1}.'
+        log.warning('Instance(s): {0} not registered with ELB {1}.'
                  .format(list(register_failures), name))
         register_result = False
     else:
@@ -689,12 +762,12 @@ def deregister_instances(name, instances, region=None, key=None, keyid=None,
         # deregister_instances returns "None" because the instances are
         # effectively deregistered from ELB
         if error.error_code == 'InvalidInstance':
-            log.warn('One or more of instance(s) {0} are not part of ELB {1}.'
+            log.warning('One or more of instance(s) {0} are not part of ELB {1}.'
                      ' deregister_instances not performed.'
                      .format(instances, name))
             return None
         else:
-            log.warn(error)
+            log.warning(error)
             return False
     registered_instance_ids = [instance.id for instance in
                                registered_instances]
@@ -702,12 +775,39 @@ def deregister_instances(name, instances, region=None, key=None, keyid=None,
     # unable to be deregistered from the given ELB
     deregister_failures = set(instances).intersection(set(registered_instance_ids))
     if deregister_failures:
-        log.warn('Instance(s): {0} not deregistered from ELB {1}.'
+        log.warning('Instance(s): {0} not deregistered from ELB {1}.'
                  .format(list(deregister_failures), name))
         deregister_result = False
     else:
         deregister_result = True
     return deregister_result
+
+
+def set_instances(name, instances, test=False, region=None, key=None, keyid=None,
+                         profile=None):
+    '''
+    Set the instances assigned to an ELB to exactly the list given
+
+    CLI example:
+
+    .. code-block:: bash
+
+        salt myminion boto_elb.set_instances myelb region=us-east-1 instances="[instance_id,instance_id]"
+    '''
+    ret = True
+    current = set([i['instance_id'] for i in get_instance_health(name, region, key, keyid, profile)])
+    desired = set(instances)
+    add = desired - current
+    remove = current - desired
+    if test:
+        return bool(add or remove)
+    if len(remove):
+        if deregister_instances(name, list(remove), region, key, keyid, profile) is False:
+            ret = False
+    if len(add):
+        if register_instances(name, list(add), region, key, keyid, profile) is False:
+            ret = False
+    return ret
 
 
 def get_instance_health(name, region=None, key=None, keyid=None, profile=None, instances=None):
@@ -743,7 +843,7 @@ def create_policy(name, policy_name, policy_type, policy, region=None,
     '''
     Create an ELB policy.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI example:
 
@@ -776,7 +876,7 @@ def delete_policy(name, policy_name, region=None, key=None, keyid=None,
     '''
     Delete an ELB policy.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI example:
 
@@ -804,11 +904,11 @@ def set_listener_policy(name, port, policies=None, region=None, key=None,
     '''
     Set the policies of an ELB listener.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI example:
 
-    .. code-block:: Boron
+    .. code-block:: Bash
 
         salt myminion boto_elb.set_listener_policy myelb 443 "[policy1,policy2]"
     '''
@@ -828,11 +928,36 @@ def set_listener_policy(name, port, policies=None, region=None, key=None,
     return True
 
 
+def set_backend_policy(name, port, policies=None, region=None, key=None,
+                       keyid=None, profile=None):
+    '''
+    Set the policies of an ELB backend server.
+
+    CLI example:
+
+        salt myminion boto_elb.set_backend_policy myelb 443 "[policy1,policy2]"
+    '''
+    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
+
+    if not exists(name, region, key, keyid, profile):
+        return True
+    if policies is None:
+        policies = []
+    try:
+        conn.set_lb_policies_of_backend_server(name, port, policies)
+        log.info('Set policies {0} on ELB {1} backend server {2}'.format(policies, name, port))
+    except boto.exception.BotoServerError as e:
+        log.debug(e)
+        log.info('Failed to set policy {0} on ELB {1} backend server {2}: {3}'.format(policies, name, port, e.message))
+        return False
+    return True
+
+
 def set_tags(name, tags, region=None, key=None, keyid=None, profile=None):
     '''
     Add the tags on an ELB
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         name of the ELB

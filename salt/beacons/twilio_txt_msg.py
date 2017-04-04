@@ -26,15 +26,15 @@ def __virtual__():
         return False
 
 
-def validate(config):
+def __validate__(config):
     '''
     Validate the beacon configuration
     '''
     # Configuration for twilio_txt_msg beacon should be a list of dicts
     if not isinstance(config, dict):
-        log.info('Configuration for twilio_txt_msg beacon must be a dictionary.')
-        return False
-    return True
+        return False, ('Configuration for twilio_txt_msg beacon '
+                       'must be a dictionary.')
+    return True, 'Valid beacon configuration'
 
 
 def beacon(config):

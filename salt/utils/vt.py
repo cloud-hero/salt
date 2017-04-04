@@ -32,14 +32,16 @@ import logging
 
 mswindows = (sys.platform == "win32")
 
-if mswindows:
+try:
     # pylint: disable=F0401,W0611
     from win32file import ReadFile, WriteFile
     from win32pipe import PeekNamedPipe
     import msvcrt
-    import _subprocess
+    import win32api
+    import win32con
+    import win32process
     # pylint: enable=F0401,W0611
-else:
+except ImportError:
     import pty
     import fcntl
     import struct
@@ -117,10 +119,9 @@ class Terminal(object):
         # Let's avoid Zombies!!!
         _cleanup()
 
-        if not args and not executable and not shell:
+        if not args and not executable:
             raise TerminalException(
-                'You need to pass at least one of \'args\', \'executable\' '
-                'or \'shell=True\''
+                'You need to pass at least one of "args", "executable" '
             )
 
         self.args = args
@@ -384,12 +385,12 @@ class Terminal(object):
             Terminates the process
             '''
             try:
-                _subprocess.TerminateProcess(self._handle, 1)
+                win32api.TerminateProcess(self._handle, 1)
             except OSError:
                 # ERROR_ACCESS_DENIED (winerror 5) is received when the
                 # process already died.
-                ecode = _subprocess.GetExitCodeProcess(self._handle)
-                if ecode == _subprocess.STILL_ACTIVE:
+                ecode = win32process.GetExitCodeProcess(self._handle)
+                if ecode == win32con.STILL_ACTIVE:
                     raise
                 self.exitstatus = ecode
 

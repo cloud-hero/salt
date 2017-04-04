@@ -34,6 +34,9 @@ import salt.fileserver
 import salt.utils
 import salt.utils.url
 
+# Import third party libs
+import salt.ext.six as six
+
 log = logging.getLogger(__name__)
 
 
@@ -91,6 +94,7 @@ def find_file(path, tgt_env='base', **kwargs):  # pylint: disable=W0613
             and not salt.fileserver.is_file_ignored(__opts__, full):
         fnd['path'] = full
         fnd['rel'] = path
+        fnd['stat'] = list(os.stat(full))
         return fnd
     return fnd
 
@@ -120,13 +124,16 @@ def serve_file(load, fnd):
         return ret
     ret['dest'] = fnd['rel']
     gzip = load.get('gzip', None)
+    fpath = os.path.normpath(fnd['path'])
 
     # AP
     # May I sleep here to slow down serving of big files?
     # How many threads are serving files?
-    with salt.utils.fopen(fnd['path'], 'rb') as fp_:
+    with salt.utils.fopen(fpath, 'rb') as fp_:
         fp_.seek(load['loc'])
         data = fp_.read(__opts__['file_buffer_size'])
+        if data and six.PY3 and not salt.utils.is_bin_file(fpath):
+            data = data.decode(__salt_system_encoding__)
         if gzip and data:
             data = salt.utils.gzip_util.compress(data, gzip)
             ret['gzip'] = gzip
@@ -153,13 +160,15 @@ def file_hash(load, fnd):
     '''
     path = fnd['path']
     ret = {}
+
     if 'env' in load:
         salt.utils.warn_until(
-            'Boron',
-            'Passing a salt environment should be done using \'saltenv\' '
-            'not \'env\'. This functionality will be removed in Salt Boron.'
-        )
-        load['saltenv'] = load.pop('env')
+            'Oxygen',
+            'Parameter \'env\' has been detected in the argument list.  This '
+            'parameter is no longer used and has been replaced by \'saltenv\' '
+            'as of Salt 2016.11.0.  This warning will be removed in Salt Oxygen.'
+            )
+        load.pop('env')
 
     if load['saltenv'] not in envs():
         return {}
@@ -224,11 +233,12 @@ def file_list(load):
     '''
     if 'env' in load:
         salt.utils.warn_until(
-            'Boron',
-            'Passing a salt environment should be done using \'saltenv\' '
-            'not \'env\'. This functionality will be removed in Salt Boron.'
-        )
-        load['saltenv'] = load.pop('env')
+            'Oxygen',
+            'Parameter \'env\' has been detected in the argument list.  This '
+            'parameter is no longer used and has been replaced by \'saltenv\' '
+            'as of Salt 2016.11.0.  This warning will be removed in Salt Oxygen.'
+            )
+        load.pop('env')
 
     if load['saltenv'] not in envs():
         return []
@@ -307,11 +317,12 @@ def dir_list(load):
     '''
     if 'env' in load:
         salt.utils.warn_until(
-            'Boron',
-            'Passing a salt environment should be done using \'saltenv\' '
-            'not \'env\'. This functionality will be removed in Salt Boron.'
-        )
-        load['saltenv'] = load.pop('env')
+            'Oxygen',
+            'Parameter \'env\' has been detected in the argument list.  This '
+            'parameter is no longer used and has been replaced by \'saltenv\' '
+            'as of Salt 2016.11.0.  This warning will be removed in Salt Oxygen.'
+            )
+        load.pop('env')
 
     if load['saltenv'] not in envs():
         return []

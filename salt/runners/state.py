@@ -8,13 +8,21 @@ import logging
 
 # Import salt libs
 import salt.loader
+import salt.utils
 import salt.utils.event
 from salt.exceptions import SaltInvocationError
 
 LOGGER = logging.getLogger(__name__)
 
 
-def orchestrate(mods, saltenv='base', test=None, exclude=None, pillar=None):
+def orchestrate(mods,
+                saltenv='base',
+                test=None,
+                exclude=None,
+                pillar=None,
+                pillarenv=None,
+                pillar_enc=None,
+                orchestration_jid=None):
     '''
     .. versionadded:: 0.17.0
 
@@ -32,6 +40,7 @@ def orchestrate(mods, saltenv='base', test=None, exclude=None, pillar=None):
 
         salt-run state.orchestrate webserver
         salt-run state.orchestrate webserver saltenv=dev test=True
+        salt-run state.orchestrate webserver saltenv=dev pillarenv=aws
 
     .. versionchanged:: 2014.1.1
 
@@ -40,6 +49,21 @@ def orchestrate(mods, saltenv='base', test=None, exclude=None, pillar=None):
     .. versionchanged:: 2014.7.0
 
         Runner uses the pillar variable
+
+    .. versionchanged:: develop
+
+        Runner uses the pillar_enc variable that allows renderers to render the pillar.
+        This is usable when supplying the contents of a file as pillar, and the file contains
+        gpg-encrypted entries.
+
+    .. seealso:: GPG renderer documentation
+
+    CLI Examples:
+
+    .. code-block:: bash
+
+       salt-run state.orchestrate webserver pillar_enc=gpg pillar="$(cat somefile.json)"
+
     '''
     if pillar is not None and not isinstance(pillar, dict):
         raise SaltInvocationError(
@@ -52,7 +76,10 @@ def orchestrate(mods, saltenv='base', test=None, exclude=None, pillar=None):
             saltenv,
             test,
             exclude,
-            pillar=pillar)
+            pillar=pillar,
+            pillarenv=pillarenv,
+            pillar_enc=pillar_enc,
+            orchestration_jid=orchestration_jid)
     ret = {'data': {minion.opts['id']: running}, 'outputter': 'highstate'}
     res = salt.utils.check_state_result(ret['data'])
     if res:
@@ -62,8 +89,8 @@ def orchestrate(mods, saltenv='base', test=None, exclude=None, pillar=None):
     return ret
 
 # Aliases for orchestrate runner
-orch = orchestrate  # pylint: disable=invalid-name
-sls = orchestrate  # pylint: disable=invalid-name
+orch = salt.utils.alias_function(orchestrate, 'orch')
+sls = salt.utils.alias_function(orchestrate, 'sls')
 
 
 def orchestrate_single(fun, name, test=None, queue=False, pillar=None, **kwargs):
@@ -157,7 +184,7 @@ def event(tagmatch='*',
     :param pretty: Output the JSON all on a single line if ``False`` (useful
         for shell tools); pretty-print the JSON output if ``True``.
     :param node: Watch the minion-side or master-side event bus.
-        .. versionadded:: Boron
+        .. versionadded:: 2016.3.0
 
     CLI Examples:
 
@@ -176,7 +203,7 @@ def event(tagmatch='*',
         # Watch the event bus forever in a shell while-loop.
         salt-run state.event | while read -r tag data; do
             echo $tag
-            echo $data | jq -colour-output .
+            echo $data | jq --color-output .
         done
 
     .. seealso::

@@ -211,7 +211,7 @@ This was designed to be run as a build job in Jenkins or similar tool. You can p
 
 **File Example: host/validation/network.yaml**
 
-.. code-block:: yaml
+.. code-block:: jinja
 
     network..dns..search:
       type: list
@@ -397,7 +397,7 @@ def ext_pillar(minion_id, pillar, resource, sequence, subkey=False, subkey_only=
 
     for categ, info in [next(six.iteritems(s)) for s in sequence]:
         if categ not in inp:
-            log.warn("Category is not defined: {0}".format(categ))
+            log.warning("Category is not defined: {0}".format(categ))
             continue
 
         alias = None
@@ -416,7 +416,7 @@ def ext_pillar(minion_id, pillar, resource, sequence, subkey=False, subkey_only=
         if isinstance(inp[categ], list):
             entries = inp[categ]
         elif not inp[categ]:
-            log.warn("Category has no value set: {0}".format(categ))
+            log.warning("Category has no value set: {0}".format(categ))
             continue
         else:
             entries = [inp[categ]]

@@ -4,13 +4,20 @@ Module for gathering and managing network information
 '''
 from __future__ import absolute_import
 
-# Import salt libs
-import salt.utils
+# Import python libs
 import hashlib
 import datetime
 import socket
+
+# Import salt libs
+import salt.utils
 import salt.utils.network
 import salt.utils.validate.net
+from salt.modules.network import (wol, get_hostname, interface, interface_ip,
+                                  subnets6, ip_in_subnet, convert_cidr,
+                                  calc_net, get_fqdn, ifacestartswith,
+                                  iphexval)
+from salt.utils import namespaced_function as _namespaced_function
 
 try:
     import salt.utils.winapi
@@ -19,6 +26,7 @@ except ImportError:
     HAS_DEPENDENCIES = False
 
 # Import 3rd party libraries
+import salt.ext.six as six  # pylint: disable=W0611
 try:
     import wmi  # pylint: disable=W0611
 except ImportError:
@@ -32,12 +40,31 @@ def __virtual__():
     '''
     Only works on Windows systems
     '''
-    if salt.utils.is_windows() and HAS_DEPENDENCIES is True:
-        return __virtualname__
-    return False
+    if not salt.utils.is_windows():
+        return False, "Module win_network: Only available on Windows"
+
+    if not HAS_DEPENDENCIES:
+        return False, "Module win_network: Missing dependencies"
+
+    global wol, get_hostname, interface, interface_ip, subnets6, ip_in_subnet
+    global convert_cidr, calc_net, get_fqdn, ifacestartswith, iphexval
+
+    wol = _namespaced_function(wol, globals())
+    get_hostname = _namespaced_function(get_hostname, globals())
+    interface = _namespaced_function(interface, globals())
+    interface_ip = _namespaced_function(interface_ip, globals())
+    subnets6 = _namespaced_function(subnets6, globals())
+    ip_in_subnet = _namespaced_function(ip_in_subnet, globals())
+    convert_cidr = _namespaced_function(convert_cidr, globals())
+    calc_net = _namespaced_function(calc_net, globals())
+    get_fqdn = _namespaced_function(get_fqdn, globals())
+    ifacestartswith = _namespaced_function(ifacestartswith, globals())
+    iphexval = _namespaced_function(iphexval, globals())
+
+    return __virtualname__
 
 
-def ping(host):
+def ping(host, timeout=False, return_boolean=False):
     '''
     Performs a ping to a host
 
@@ -46,9 +73,36 @@ def ping(host):
     .. code-block:: bash
 
         salt '*' network.ping archlinux.org
+
+    .. versionadded:: 2016.11.0
+
+    Return a True or False instead of ping output.
+
+    .. code-block:: bash
+
+        salt '*' network.ping archlinux.org return_boolean=True
+
+    Set the time to wait for a response in seconds.
+
+    .. code-block:: bash
+
+        salt '*' network.ping archlinux.org timeout=3
     '''
-    cmd = ['ping', '-n', '4', salt.utils.network.sanitize_host(host)]
-    return __salt__['cmd.run'](cmd, python_shell=False)
+    if timeout:
+        # Windows ping differs by having timeout be for individual echo requests.'
+        # Divide timeout by tries to mimic BSD behaviour.
+        timeout = int(timeout) * 1000 // 4
+        cmd = ['ping', '-n', '4', '-w', str(timeout), salt.utils.network.sanitize_host(host)]
+    else:
+        cmd = ['ping', '-n', '4', salt.utils.network.sanitize_host(host)]
+    if return_boolean:
+        ret = __salt__['cmd.run_all'](cmd, python_shell=False)
+        if ret['retcode'] != 0:
+            return False
+        else:
+            return True
+    else:
+        return __salt__['cmd.run'](cmd, python_shell=False)
 
 
 def netstat():
@@ -231,7 +285,7 @@ def hw_addr(iface):
     return salt.utils.network.hw_addr(iface)
 
 # Alias hwaddr to preserve backward compat
-hwaddr = hw_addr
+hwaddr = salt.utils.alias_function(hw_addr, 'hwaddr')
 
 
 def subnets():
@@ -275,7 +329,7 @@ def ip_addrs(interface=None, include_loopback=False):
     return salt.utils.network.ip_addrs(interface=interface,
                                        include_loopback=include_loopback)
 
-ipaddrs = ip_addrs
+ipaddrs = salt.utils.alias_function(ip_addrs, 'ipaddrs')
 
 
 def ip_addrs6(interface=None, include_loopback=False):
@@ -293,7 +347,7 @@ def ip_addrs6(interface=None, include_loopback=False):
     return salt.utils.network.ip_addrs6(interface=interface,
                                         include_loopback=include_loopback)
 
-ipaddrs6 = ip_addrs6
+ipaddrs6 = salt.utils.alias_function(ip_addrs6, 'ipaddrs6')
 
 
 def connect(host, port=None, **kwargs):
@@ -301,7 +355,7 @@ def connect(host, port=None, **kwargs):
     Test connectivity to a host using a particular
     port from the minion.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 

@@ -3,7 +3,7 @@
 Manage entries in an LDAP database
 ==================================
 
-.. versionadded:: Boron
+.. versionadded:: 2016.3.0
 
 The ``states.ldap`` state module allows you to manage LDAP entries and
 their attributes.
@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 
 
 def managed(name, entries, connect_spec=None):
-    '''Ensure the existance (or not) of LDAP entries and their attributes
+    '''Ensure the existence (or not) of LDAP entries and their attributes
 
     Example:
 

@@ -2,7 +2,7 @@
 # https://msdn.microsoft.com/en-us/library/windows/desktop/aa383608(v=vs.85).aspx
 '''
 Windows Task Scheduler Module
-.. versionadded:: Boron
+.. versionadded:: 2016.3.0
 
 A module for working with the Windows Task Scheduler.
 You can add and edit existing tasks.
@@ -15,10 +15,15 @@ from __future__ import absolute_import
 import salt.utils
 from datetime import datetime
 import logging
+import time
 
 # Import 3rd Party Libraries
-import pythoncom
-import win32com.client
+try:
+    import pythoncom
+    import win32com.client
+    HAS_DEPENDENCIES = True
+except ImportError:
+    HAS_DEPENDENCIES = False
 from salt.ext.six.moves import range
 
 log = logging.getLogger(__name__)
@@ -67,7 +72,14 @@ TASK_LOGON_INTERACTIVE_TOKEN_OR_PASSWORD = 6
 TASK_RUNLEVEL_LUA = 0
 TASK_RUNLEVEL_HIGHEST = 1
 
-# TASK_TRIGGER_TYPE2
+# TASK_STATE_TYPE
+TASK_STATE_UNKNOWN = 0
+TASK_STATE_DISABLED = 1
+TASK_STATE_QUEUED = 2
+TASK_STATE_READY = 3
+TASK_STATE_RUNNING = 4
+
+# TASK_TRIGGER_TYPE
 TASK_TRIGGER_EVENT = 0
 TASK_TRIGGER_TIME = 1
 TASK_TRIGGER_DAILY = 2
@@ -94,8 +106,8 @@ duration = {'Immediately': 'PT0M',
             '4 hours': 'PT4H',
             '8 hours': 'PT8H',
             '12 hours': 'PT12H',
-            '1 day': 'P1D',
-            '3 days': 'P3D',
+            '1 day': ['P1D', 'PT24H'],
+            '3 days': ['P3D', 'PT72H'],
             '30 days': 'P30D',
             '90 days': 'P90D',
             '180 days': 'P180D',
@@ -105,14 +117,55 @@ action_types = {'Execute': TASK_ACTION_EXEC,
                 'Email': TASK_ACTION_SEND_EMAIL,
                 'Message': TASK_ACTION_SHOW_MESSAGE}
 
+trigger_types = {'Event': TASK_TRIGGER_EVENT,
+                 'Once': TASK_TRIGGER_TIME,
+                 'Daily': TASK_TRIGGER_DAILY,
+                 'Weekly': TASK_TRIGGER_WEEKLY,
+                 'Monthly': TASK_TRIGGER_MONTHLY,
+                 'MonthlyDay': TASK_TRIGGER_MONTHLYDOW,
+                 'OnIdle': TASK_TRIGGER_IDLE,
+                 'OnTaskCreation': TASK_TRIGGER_REGISTRATION,
+                 'OnBoot': TASK_TRIGGER_BOOT,
+                 'OnLogon': TASK_TRIGGER_LOGON,
+                 'OnSessionChange': TASK_TRIGGER_SESSION_STATE_CHANGE}
+
+states = {TASK_STATE_UNKNOWN: 'Unknown',
+          TASK_STATE_DISABLED: 'Disabled',
+          TASK_STATE_QUEUED: 'Queued',
+          TASK_STATE_READY: 'Ready',
+          TASK_STATE_RUNNING: 'Running'}
+
+instances = {'Parallel': TASK_INSTANCES_PARALLEL,
+             'Queue': TASK_INSTANCES_QUEUE,
+             'No New Instance': TASK_INSTANCES_IGNORE_NEW,
+             'Stop Existing': TASK_INSTANCES_STOP_EXISTING}
+
+results = {0x0: 'The operation completed successfully',
+           0x1: 'Incorrect or unknown function called',
+           0x2: 'File not found',
+           0xA: 'The environment is incorrect',
+           0x41300: 'Task is ready to run at its next scheduled time',
+           0x41301: 'Task is currently running',
+           0x41302: 'Task is disabled',
+           0x41303: 'Task has not yet run',
+           0x41304: 'There are no more runs scheduled for this task',
+           0x41306: 'Task was terminated by the user',
+           0x8004130F: 'Credentials became corrupted',
+           0x8004131F: 'An instance of this task is already running',
+           0x800704DD: 'The service is not available (Run only when logged in?)',
+           0xC000013A: 'The application terminated as a result of CTRL+C',
+           0xC06D007E: 'Unknown software exception'}
+
 
 def __virtual__():
     '''
     Only works on Windows systems
     '''
     if salt.utils.is_windows():
+        if not HAS_DEPENDENCIES:
+            log.warning('Could not load dependencies for {0}'.format(__virtualname__))
         return __virtualname__
-    return False
+    return (False, "Module win_task: module only works on Windows systems")
 
 
 def _get_date_time_format(dt_string):
@@ -146,6 +199,66 @@ def _get_date_time_format(dt_string):
         except ValueError:
             continue
     return False
+
+
+def _get_date_value(date):
+    '''
+    Function for dealing with PyTime values with invalid dates. ie: 12/30/1899
+    which is the windows task scheduler value for Never
+
+    :param obj date: A PyTime object
+
+    :return: A string value representing the date or the word "Never" for
+    invalid date strings
+    :rtype: str
+    '''
+    try:
+        return '{0}'.format(date)
+    except ValueError:
+        return 'Never'
+
+
+def _reverse_lookup(dictionary, value):
+    '''
+    Lookup the key in a dictionary by it's value. Will return the first match.
+
+    :param dict dictionary: The dictionary to search
+
+    :param str value: The value to search for.
+
+    :return: Returns the first key to match the value
+    :rtype: str
+    '''
+    value_index = -1
+    for idx, dict_value in enumerate(dictionary.values()):
+        if type(dict_value) == list:
+            if value in dict_value:
+                value_index = idx
+                break
+        elif value == dict_value:
+            value_index = idx
+            break
+
+    return dictionary.keys()[value_index]
+
+
+def _lookup_first(dictionary, key):
+    '''
+    Lookup the first value given a key. Returns the first value if the key
+    refers to a list or the value itself.
+
+    :param dict dictionary: The dictionary to search
+
+    :param str key: The key to get
+
+    :return: Returns the first value available for the key
+    :rtype: str
+    '''
+    value = dictionary[key]
+    if type(value) == list:
+        return value[0]
+    else:
+        return value
 
 
 def _save_task_definition(name,
@@ -210,6 +323,12 @@ def list_tasks(location='\\'):
 
     :return: Returns a list of tasks.
     :rtype: list
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.list_tasks
     '''
     # Create the task service object
     pythoncom.CoInitialize()
@@ -237,6 +356,12 @@ def list_folders(location='\\'):
 
     :return: Returns a list of folders.
     :rtype: list
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.list_folders
     '''
     # Create the task service object
     pythoncom.CoInitialize()
@@ -266,6 +391,12 @@ def list_triggers(name, location='\\'):
 
     :return: Returns a list of triggers.
     :rtype: list
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.list_triggers <task_name>
     '''
     # Create the task service object
     pythoncom.CoInitialize()
@@ -296,6 +427,12 @@ def list_actions(name, location='\\'):
 
     :return: Returns a list of actions.
     :rtype: list
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.list_actions <task_name>
     '''
     # Create the task service object
     pythoncom.CoInitialize()
@@ -318,6 +455,7 @@ def create_task(name,
                 location='\\',
                 user_name='System',
                 password=None,
+                force=False,
                 **kwargs):
     r'''
     Create a new task in the designated location. This function has many keyword
@@ -341,11 +479,19 @@ def create_task(name,
     the task to run whether the user is logged in or not, but is currently not
     working.
 
+    :param bool force: If the task exists, overwrite the existing task.
+
     :return: True if successful, False if unsuccessful
     :rtype: bool
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.create_task <task_name> user_name=System force=True action_type=Execute cmd='del /Q /S C:\\Temp' trigger_type=Once start_date=2016-12-1 start_time=01:00
     '''
     # Check for existing task
-    if name in list_tasks(location):
+    if name in list_tasks(location) and not force:
         # Connect to an existing task definition
         return '{0} already exists'.format(name)
 
@@ -360,7 +506,8 @@ def create_task(name,
     # Modify task settings
     edit_task(task_definition=task_definition,
               user_name=user_name,
-              password=password)
+              password=password,
+              **kwargs)
 
     # Add Action
     add_action(task_definition=task_definition, **kwargs)
@@ -403,7 +550,7 @@ def create_task_from_xml(name,
     (C:\Windows\System32\tasks).
 
     :param str xml_text: A string of xml representing the task to be created.
-    This will be overriden by `xml_path` if passed.
+    This will be overridden by `xml_path` if passed.
 
     :param str xml_path: The path to an XML file on the local system containing
     the xml that defines the task. This will override `xml_text`
@@ -417,6 +564,12 @@ def create_task_from_xml(name,
 
     :return: True if successful, False if unsuccessful
     :rtype: bool
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.create_task_from_xml <task_name> xml_path=C:\task.xml
     '''
     # Check for existing task
     if name in list_tasks(location):
@@ -494,6 +647,12 @@ def create_folder(name, location='\\'):
 
     :return: True if successful, False if unsuccessful
     :rtype: bool
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.create_folder <folder_name>
     '''
     # Check for existing folder
     if name in list_folders(location):
@@ -684,14 +843,14 @@ def edit_task(name=None,
 
     :return: True if successful, False if unsuccessful
     :rtype: bool
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.edit_task <task_name> description='This task is awesome'
     '''
     # TODO: Add more detailed return for items changed
-
-    # Define Lookup Dictionaries
-    instances = {'Parallel': TASK_INSTANCES_PARALLEL,
-                 'Queue': TASK_INSTANCES_QUEUE,
-                 'No New Instance': TASK_INSTANCES_IGNORE_NEW,
-                 'Stop Existing': TASK_INSTANCES_STOP_EXISTING}
 
     # Check for passed task_definition
     # If not passed, open a task definition for an existing task
@@ -773,12 +932,12 @@ def edit_task(name=None,
             task_definition.Settings.IdleSettings.RestartOnIdle = idle_restart
         if idle_duration is not None:
             if idle_duration in duration:
-                task_definition.Settings.IdleSettings.IdleDuration = duration[idle_duration]
+                task_definition.Settings.IdleSettings.IdleDuration = _lookup_first(duration, idle_duration)
             else:
                 return 'Invalid value for "idle_duration"'
         if idle_wait_timeout is not None:
             if idle_wait_timeout in duration:
-                task_definition.Settings.IdleSettings.WaitTimeout = duration[idle_wait_timeout]
+                task_definition.Settings.IdleSettings.WaitTimeout = _lookup_first(duration, idle_wait_timeout)
             else:
                 return 'Invalid value for "idle_wait_timeout"'
 
@@ -810,7 +969,7 @@ def edit_task(name=None,
             task_definition.Settings.RestartInterval = ''
         else:
             if restart_every in duration:
-                task_definition.Settings.RestartInterval = duration[restart_every]
+                task_definition.Settings.RestartInterval = _lookup_first(duration, restart_every)
             else:
                 return 'Invalid value for "restart_every"'
     if task_definition.Settings.RestartInterval:
@@ -824,7 +983,7 @@ def edit_task(name=None,
             task_definition.Settings.ExecutionTimeLimit = 'PT0S'
         else:
             if execution_time_limit in duration:
-                task_definition.Settings.ExecutionTimeLimit = duration[execution_time_limit]
+                task_definition.Settings.ExecutionTimeLimit = _lookup_first(duration, execution_time_limit)
             else:
                 return 'Invalid value for "execution_time_limit"'
     if force_stop is not None:
@@ -834,7 +993,7 @@ def edit_task(name=None,
         if delete_after is False:
             task_definition.Settings.DeleteExpiredTaskAfter = ''
         if delete_after in duration:
-            task_definition.Settings.DeleteExpiredTaskAfter = duration[delete_after]
+            task_definition.Settings.DeleteExpiredTaskAfter = _lookup_first(duration, delete_after)
         else:
             return 'Invalid value for "delete_after"'
     if multiple_instances is not None:
@@ -863,6 +1022,12 @@ def delete_task(name, location='\\'):
 
     :return: True if successful, False if unsuccessful
     :rtype: bool
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.delete_task <task_name>
     '''
     # Check for existing task
     if name not in list_tasks(location):
@@ -897,6 +1062,12 @@ def delete_folder(name, location='\\'):
 
     :return: True if successful, False if unsuccessful
     :rtype: bool
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.delete_folder <folder_name>
     '''
     # Check for existing folder
     if name not in list_folders(location):
@@ -932,6 +1103,12 @@ def run(name, location='\\'):
 
     :return: True if successful, False if unsuccessful
     :rtype: bool
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.list_run <task_name>
     '''
     # Check for existing folder
     if name not in list_tasks(location):
@@ -951,6 +1128,271 @@ def run(name, location='\\'):
         return True
     except pythoncom.com_error as error:
         return False
+
+
+def run_wait(name, location='\\'):
+    r'''
+    Run a scheduled task and return when the task finishes
+
+    :param str name: The name of the task to run.
+
+    :param str location: A string value representing the location of the task.
+    Default is '\\' which is the root for the task scheduler
+    (C:\Windows\System32\tasks).
+
+    :return: True if successful, False if unsuccessful
+    :rtype: bool
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.list_run_wait <task_name>
+    '''
+    # Check for existing folder
+    if name not in list_tasks(location):
+        return '{0} not found in {1}'.format(name, location)
+
+    # connect to the task scheduler
+    pythoncom.CoInitialize()
+    task_service = win32com.client.Dispatch("Schedule.Service")
+    task_service.Connect()
+
+    # get the folder to delete the folder from
+    task_folder = task_service.GetFolder(location)
+    task = task_folder.GetTask(name)
+
+    # Is the task already running
+    if task.State == TASK_STATE_RUNNING:
+        return 'Task already running'
+
+    try:
+        task.Run('')
+        time.sleep(1)
+        running = True
+    except pythoncom.com_error:
+        return False
+
+    while running:
+        running = False
+        try:
+            running_tasks = task_service.GetRunningTasks(0)
+            if running_tasks.Count:
+                for item in running_tasks:
+                    if item.Name == name:
+                        running = True
+        except pythoncom.com_error:
+            running = False
+
+    return True
+
+
+def stop(name, location='\\'):
+    r'''
+    Stop a scheduled task.
+
+    :param str name: The name of the task to stop.
+
+    :param str location: A string value representing the location of the task.
+    Default is '\\' which is the root for the task scheduler
+    (C:\Windows\System32\tasks).
+
+    :return: True if successful, False if unsuccessful
+    :rtype: bool
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.list_stop <task_name>
+    '''
+    # Check for existing folder
+    if name not in list_tasks(location):
+        return '{0} not found in {1}'.format(name, location)
+
+    # connect to the task scheduler
+    pythoncom.CoInitialize()
+    task_service = win32com.client.Dispatch("Schedule.Service")
+    task_service.Connect()
+
+    # get the folder to delete the folder from
+    task_folder = task_service.GetFolder(location)
+    task = task_folder.GetTask(name)
+
+    try:
+        task.Stop(0)
+        return True
+    except pythoncom.com_error as error:
+        return False
+
+
+def status(name, location='\\'):
+    r'''
+    Determine the status of a task. Is it Running, Queued, Ready, etc.
+
+    :param str name: The name of the task for which to return the status
+
+    :param str location: A string value representing the location of the task.
+    Default is '\\' which is the root for the task scheduler
+    (C:\Windows\System32\tasks).
+
+    :return: The current status of the task. Will be one of the following:
+    - Unknown
+    - Disabled
+    - Queued
+    - Ready
+    - Running
+    :rtype: string
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.list_status <task_name>
+    '''
+    # Check for existing folder
+    if name not in list_tasks(location):
+        return '{0} not found in {1}'.format(name, location)
+
+    # connect to the task scheduler
+    pythoncom.CoInitialize()
+    task_service = win32com.client.Dispatch("Schedule.Service")
+    task_service.Connect()
+
+    # get the folder to delete the folder from
+    task_folder = task_service.GetFolder(location)
+    task = task_folder.GetTask(name)
+
+    return states[task.State]
+
+
+def info(name, location='\\'):
+    r'''
+    Get the details about a task in the task scheduler.
+
+    :param str name: The name of the task for which to return the status
+
+    :param str location: A string value representing the location of the task.
+    Default is '\\' which is the root for the task scheduler
+    (C:\Windows\System32\tasks).
+
+    :return:
+    :rtype: dict
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.info <task_name>
+    '''
+    # Check for existing folder
+    if name not in list_tasks(location):
+        return '{0} not found in {1}'.format(name, location)
+
+    # connect to the task scheduler
+    pythoncom.CoInitialize()
+    task_service = win32com.client.Dispatch("Schedule.Service")
+    task_service.Connect()
+
+    # get the folder to delete the folder from
+    task_folder = task_service.GetFolder(location)
+    task = task_folder.GetTask(name)
+
+    properties = {'enabled': task.Enabled,
+                  'last_run': _get_date_value(task.LastRunTime),
+                  'last_run_result': results[task.LastTaskResult],
+                  'missed_runs': task.NumberOfMissedRuns,
+                  'next_run': _get_date_value(task.NextRunTime),
+                  'status': states[task.State]}
+
+    def_set = task.Definition.Settings
+
+    settings = {}
+    settings['allow_demand_start'] = def_set.AllowDemandStart
+    settings['force_stop'] = def_set.AllowHardTerminate
+
+    if def_set.DeleteExpiredTaskAfter == '':
+        settings['delete_after'] = False
+    elif def_set.DeleteExpiredTaskAfter == 'PT0S':
+        settings['delete_after'] = 'Immediately'
+    else:
+        settings['delete_after'] = _reverse_lookup(duration, def_set.DeleteExpiredTaskAfter)
+
+    if def_set.ExecutionTimeLimit == '':
+        settings['execution_time_limit'] = False
+    else:
+        settings['execution_time_limit'] = _reverse_lookup(duration, def_set.ExecutionTimeLimit)
+
+    settings['multiple_instances'] = _reverse_lookup(instances, def_set.MultipleInstances)
+
+    if def_set.RestartInterval == '':
+        settings['restart_interval'] = False
+    else:
+        settings['restart_interval'] = _reverse_lookup(duration, def_set.RestartInterval)
+
+    if settings['restart_interval']:
+        settings['restart_count'] = def_set.RestartCount
+    settings['stop_if_on_batteries'] = def_set.StopIfGoingOnBatteries
+    settings['wake_to_run'] = def_set.WakeToRun
+
+    conditions = {}
+    conditions['ac_only'] = def_set.DisallowStartIfOnBatteries
+    conditions['run_if_idle'] = def_set.RunOnlyIfIdle
+    conditions['run_if_network'] = def_set.RunOnlyIfNetworkAvailable
+    conditions['start_when_available'] = def_set.StartWhenAvailable
+
+    if conditions['run_if_idle']:
+        idle_set = def_set.IdleSettings
+        conditions['idle_duration'] = idle_set.IdleDuration
+        conditions['idle_restart'] = idle_set.RestartOnIdle
+        conditions['idle_stop_on_end'] = idle_set.StopOnIdleEnd
+        conditions['idle_wait_timeout'] = idle_set.WaitTimeout
+
+    if conditions['run_if_network']:
+        net_set = def_set.NetworkSettings
+        conditions['network_id'] = net_set.Id
+        conditions['network_name'] = net_set.Name
+
+    actions = []
+    for actionObj in task.Definition.Actions:
+        action = {}
+        action['action_type'] = _reverse_lookup(action_types, actionObj.Type)
+        if actionObj.Path:
+            action['cmd'] = actionObj.Path
+        if actionObj.Arguments:
+            action['arguments'] = actionObj.Arguments
+        if actionObj.WorkingDirectory:
+            action['working_dir'] = actionObj.WorkingDirectory
+        actions.append(action)
+
+    triggers = []
+    for triggerObj in task.Definition.Triggers:
+        trigger = {}
+        trigger['trigger_type'] = _reverse_lookup(trigger_types, triggerObj.Type)
+        if triggerObj.ExecutionTimeLimit:
+            trigger['execution_time_limit'] = _reverse_lookup(duration, triggerObj.ExecutionTimeLimit)
+        if triggerObj.StartBoundary:
+            start_date, start_time = triggerObj.StartBoundary.split('T', 1)
+            trigger['start_date'] = start_date
+            trigger['start_time'] = start_time
+        if triggerObj.EndBoundary:
+            end_date, end_time = triggerObj.EndBoundary.split('T', 1)
+            trigger['end_date'] = end_date
+            trigger['end_time'] = end_time
+        trigger['enabled'] = triggerObj.Enabled
+        if triggerObj.RandomDelay == '':
+            trigger['random_delay'] = False
+        else:
+            trigger['random_delay'] = _reverse_lookup(duration, triggerObj.RandomDelay)
+        triggers.append(trigger)
+
+    properties['settings'] = settings
+    properties['conditions'] = conditions
+    properties['actions'] = actions
+    properties['triggers'] = triggers
+    ret = properties
+
+    return ret
 
 
 def add_action(name=None,
@@ -980,13 +1422,21 @@ def add_action(name=None,
     *Execute*
     Execute a command or an executable.
 
-    :param str cmd: (required) The command/executable to run along with any
-    required arguments. For launching a script the first command will need to be
-    the interpreter for the script. For example, to run a vbscript you would
-    first call `cscript.exe` and pass the script as an argument as follows:
-    - ``cscript.exe c:\scripts\myscript.vbs``
+    :param str cmd: (required) The command / executable to run.
 
-    :param str start_in: The current working directory for the command.
+    :param str arguments: (optional) Arguments to be passed to the command /
+    executable. To launch a script the first command will need to be the
+    interpreter for the script. For example, to run a vbscript you would
+    pass `cscript.exe` in the `cmd` parameter and pass the script in the
+    `arguments` parameter as follows:
+
+    - ``cmd='cscript.exe' arguments='c:\scripts\myscript.vbs'``
+
+    Batch files do not need an interpreter and may be passed to the cmd
+    parameter directly.
+
+    :param str start_in: (optional) The current working directory for the
+    command.
 
     *Email*
     Send and email. Requires ``server``, ``from``, and ``to`` or ``cc``.
@@ -1012,6 +1462,12 @@ def add_action(name=None,
 
     :return: True if successful, False if unsuccessful
     :rtype: bool
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.add_action <task_name> cmd='del /Q /S C:\\Temp'
     '''
     save_definition = False
     if kwargs.get('task_definition', False):
@@ -1045,11 +1501,10 @@ def add_action(name=None,
     if action_types[action_type] == TASK_ACTION_EXEC:
         task_action.Id = 'Execute_ID1'
         if kwargs.get('cmd', False):
-            cmd = kwargs.get('cmd').split()
-            task_action.Path = cmd[0]
-            task_action.Arguments = u' '.join(cmd[1:])
+            task_action.Path = kwargs.get('cmd')
         else:
             return 'Required parameter "cmd" not found'
+        task_action.Arguments = kwargs.get('arguments', '')
         task_action.WorkingDirectory = kwargs.get('start_in', '')
 
     elif action_types[action_type] == TASK_ACTION_SEND_EMAIL:
@@ -1364,23 +1819,17 @@ def add_trigger(name=None,
 
     :return: True if successful, False if unsuccessful
     :rtype: bool
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.add_trigger <task_name> trigger_type=Once trigger_enabled=True start_date=2016/12/1 start_time=12:01
     '''
     if not trigger_type:
         return 'Required parameter "trigger_type" not specified'
 
     # Define lookup dictionaries
-    trigger_types = {'Event': TASK_TRIGGER_EVENT,
-                     'Once': TASK_TRIGGER_TIME,
-                     'Daily': TASK_TRIGGER_DAILY,
-                     'Weekly': TASK_TRIGGER_WEEKLY,
-                     'Monthly': TASK_TRIGGER_MONTHLY,
-                     'MonthlyDay': TASK_TRIGGER_MONTHLYDOW,
-                     'OnIdle': TASK_TRIGGER_IDLE,
-                     'OnTaskCreation': TASK_TRIGGER_REGISTRATION,
-                     'OnBoot': TASK_TRIGGER_BOOT,
-                     'OnLogon': TASK_TRIGGER_LOGON,
-                     'OnSessionChange': TASK_TRIGGER_SESSION_STATE_CHANGE}
-
     state_changes = {'ConsoleConnect': 1,
                      'ConsoleDisconnect': 2,
                      'RemoteConnect': 3,
@@ -1527,14 +1976,14 @@ def add_trigger(name=None,
     trigger.StartBoundary = start_boundary
     # Advanced Settings
     if random_delay:
-        trigger.RandomDelay = duration[random_delay]
+        trigger.RandomDelay = _lookup_first(duration, random_delay)
     if repeat_interval:
-        trigger.Repetition.Interval = duration[repeat_interval]
+        trigger.Repetition.Interval = _lookup_first(duration, repeat_interval)
         if repeat_duration:
-            trigger.Repetition.Duration = duration[repeat_duration]
+            trigger.Repetition.Duration = _lookup_first(duration, repeat_duration)
         trigger.Repetition.StopAtDurationEnd = repeat_stop_at_duration_end
     if execution_time_limit:
-        trigger.ExecutionTimeLimit = duration[execution_time_limit]
+        trigger.ExecutionTimeLimit = _lookup_first(duration, execution_time_limit)
     if end_boundary:
         trigger.EndBoundary = end_boundary
     trigger.Enabled = trigger_enabled
@@ -1670,6 +2119,12 @@ def clear_triggers(name, location='\\'):
 
     :return: True if successful, False if unsuccessful
     :rtype: bool
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt 'minion-id' task.clear_trigger <task_name>
     '''
     # Check for existing task
     if name not in list_tasks(location):

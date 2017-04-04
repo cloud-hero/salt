@@ -24,7 +24,10 @@ def __virtual__():
     '''
     Confirm this module is on a Debian based system
     '''
-    return __virtualname__ if __grains__['os_family'] == 'Debian' else False
+    if __grains__['os_family'] == 'Debian':
+        return __virtualname__
+    return (False, 'The dpkg execution module cannot be loaded: '
+            'only works on Debian family systems.')
 
 
 def bin_pkg_info(path, saltenv='base'):
@@ -245,17 +248,27 @@ def file_dict(*packages):
     return {'errors': errors, 'packages': ret}
 
 
-def _get_pkg_info(*packages):
+def _get_pkg_info(*packages, **kwargs):
     '''
-    Return list of package informations. If 'packages' parameter is empty,
+    Return list of package information. If 'packages' parameter is empty,
     then data about all installed packages will be returned.
 
     :param packages: Specified packages.
+    :param failhard: Throw an exception if no packages found.
     :return:
     '''
+    kwargs = salt.utils.clean_kwargs(**kwargs)
+    failhard = kwargs.pop('failhard', True)
+    if kwargs:
+        salt.utils.invalid_kwargs(kwargs)
 
-    ret = list()
-    cmd = "dpkg-query -W -f='package:${binary:Package}\\n" \
+    if __grains__['os'] == 'Ubuntu' and __grains__['osrelease_info'] < (12, 4):
+        bin_var = '${binary}'
+    else:
+        bin_var = '${Package}'
+
+    ret = []
+    cmd = "dpkg-query -W -f='package:" + bin_var + "\\n" \
           "revision:${binary:Revision}\\n" \
           "architecture:${Architecture}\\n" \
           "maintainer:${Maintainer}\\n" \
@@ -278,11 +291,14 @@ def _get_pkg_info(*packages):
 
     call = __salt__['cmd.run_all'](cmd, python_chell=False)
     if call['retcode']:
-        raise CommandExecutionError("Error getting packages information: {0}".format(call['stderr']))
+        if failhard:
+            raise CommandExecutionError("Error getting packages information: {0}".format(call['stderr']))
+        else:
+            return ret
 
-    for pkg_info in [elm for elm in re.split(r"----*", call['stdout']) if elm.strip()]:
-        pkg_data = dict()
-        pkg_info, pkg_descr = re.split(r"====*", pkg_info)
+    for pkg_info in [elm for elm in re.split(r"------", call['stdout']) if elm.strip()]:
+        pkg_data = {}
+        pkg_info, pkg_descr = re.split(r"======", pkg_info)
         for pkg_info_line in [el.strip() for el in pkg_info.split(os.linesep) if el.strip()]:
             key, value = pkg_info_line.split(":", 1)
             if value:
@@ -307,9 +323,10 @@ def _get_pkg_license(pkg):
     licenses = set()
     cpr = "/usr/share/doc/{0}/copyright".format(pkg)
     if os.path.exists(cpr):
-        for line in open(cpr).read().split(os.linesep):
-            if line.startswith("License:"):
-                licenses.add(line.split(":", 1)[1].strip())
+        with salt.utils.fopen(cpr) as fp_:
+            for line in fp_.read().split(os.linesep):
+                if line.startswith("License:"):
+                    licenses.add(line.split(":", 1)[1].strip())
 
     return ", ".join(sorted(licenses))
 
@@ -344,41 +361,57 @@ def _get_pkg_ds_avail():
     ret = dict()
     pkg_mrk = "Package:"
     pkg_name = "package"
-    for pkg_info in open(avail).read().split(pkg_mrk):
-        nfo = dict()
-        for line in (pkg_mrk + pkg_info).split(os.linesep):
-            line = line.split(": ", 1)
-            if len(line) != 2:
-                continue
-            key, value = line
-            if value.strip():
-                nfo[key.lower()] = value
-        if nfo.get(pkg_name):
-            ret[nfo[pkg_name]] = nfo
+    with salt.utils.fopen(avail) as fp_:
+        for pkg_info in fp_.read().split(pkg_mrk):
+            nfo = dict()
+            for line in (pkg_mrk + pkg_info).split(os.linesep):
+                line = line.split(": ", 1)
+                if len(line) != 2:
+                    continue
+                key, value = line
+                if value.strip():
+                    nfo[key.lower()] = value
+            if nfo.get(pkg_name):
+                ret[nfo[pkg_name]] = nfo
 
     return ret
 
 
-def info(*packages):
+def info(*packages, **kwargs):
     '''
-    Return a detailed package(s) summary information.
-    If no packages specified, all packages will be returned.
+    Returns a detailed summary of package information for provided package names.
+    If no packages are specified, all packages will be returned.
 
-    :param packages:
-    :return:
+    .. versionadded:: 2015.8.1
+
+    packages
+        The names of the packages for which to return information.
+
+    failhard
+        Whether to throw an exception if none of the packages are installed.
+        Defaults to True.
+
+        .. versionadded:: 2016.11.3
 
     CLI example:
 
     .. code-block:: bash
 
+        salt '*' lowpkg.info
         salt '*' lowpkg.info apache2 bash
+        salt '*' lowpkg.info 'php5*' failhard=false
     '''
     # Get the missing information from the /var/lib/dpkg/available, if it is there.
     # However, this file is operated by dselect which has to be installed.
     dselect_pkg_avail = _get_pkg_ds_avail()
 
+    kwargs = salt.utils.clean_kwargs(**kwargs)
+    failhard = kwargs.pop('failhard', True)
+    if kwargs:
+        salt.utils.invalid_kwargs(kwargs)
+
     ret = dict()
-    for pkg in _get_pkg_info(*packages):
+    for pkg in _get_pkg_info(*packages, failhard=failhard):
         # Merge extra information from the dselect, if available
         for pkg_ext_k, pkg_ext_v in dselect_pkg_avail.get(pkg['package'], {}).items():
             if pkg_ext_k not in pkg:

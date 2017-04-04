@@ -40,13 +40,20 @@ passed in as a dict, or as a string to pull from pillars or minion config:
         boto_secgroup.present:
             - name: mysecgroup
             - description: My security group
+            - vpc_name: myvpc
             - rules:
                 - ip_protocol: tcp
                   from_port: 80
                   to_port: 80
                   cidr_ip:
-                    - 10.0.0.0/0
-                    - 192.168.0.0/0
+                    - 10.0.0.0/8
+                    - 192.168.0.0/16
+                - ip_protocol: tcp
+                  from_port: 8080
+                  to_port: 8090
+                  cidr_ip:
+                    - 10.0.0.0/8
+                    - 192.168.0.0/16
                 - ip_protocol: icmp
                   from_port: -1
                   to_port: -1
@@ -56,8 +63,8 @@ passed in as a dict, or as a string to pull from pillars or minion config:
                   from_port: -1
                   to_port: -1
                   cidr_ip:
-                    - 10.0.0.0/0
-                    - 192.168.0.0/0
+                    - 10.0.0.0/8
+                    - 192.168.0.0/16
             - tags:
                 SomeTag: 'My Tag Value'
                 SomeOtherTag: 'Other Tag Value'
@@ -70,7 +77,6 @@ passed in as a dict, or as a string to pull from pillars or minion config:
         boto_secgroup.present:
             - name: mysecgroup
             - description: My security group
-            - region: us-east-1
             - profile: myprofile
 
     # Passing in a profile
@@ -78,15 +84,25 @@ passed in as a dict, or as a string to pull from pillars or minion config:
         boto_secgroup.present:
             - name: mysecgroup
             - description: My security group
-            - region: us-east-1
             - profile:
                 keyid: GKTADJGHEIQSXMKKRBJ08H
                 key: askdjghsdfjkghWupUjasdflkdfklgjsdfjajkghs
+                region: us-east-1
+
+.. note::
+
+    When using the ``profile`` parameter and ``region`` is set outside of
+    the profile group, region is ignored and a default region will be used.
+
+    If ``region`` is missing from the ``profile`` data set, ``us-east-1``
+    will be used as the default region.
+
 '''
 from __future__ import absolute_import
 
 # Import Python libs
 import logging
+import pprint
 
 # Import salt libs
 import salt.utils.dictupdate as dictupdate
@@ -128,9 +144,11 @@ def present(
         The ID of the VPC to create the security group in, if any. Exclusive with vpc_name.
 
     vpc_name
-        The name of the VPC to create the security group in, if any. Exlusive with vpc_id.
+        The name of the VPC to create the security group in, if any. Exclusive with vpc_id.
 
-        .. versionadded:: Boron
+        .. versionadded:: 2016.3.0
+
+        .. versionadded:: 2015.8.2
 
     rules
         A list of ingress rule dicts. If not specified, ``rules=None``,
@@ -153,12 +171,12 @@ def present(
 
     profile
         A dict with region, key and keyid, or a pillar key (string)
-        that contains a dict with region, key and keyid.
+        that contains a dict with region, key, and keyid.
 
     tags
         List of key:value pairs of tags to set on the security group
 
-        .. versionadded:: Boron
+        .. versionadded:: 2016.3.0
     '''
     ret = {'name': name, 'result': True, 'comment': '', 'changes': {}}
     _ret = _security_group_present(name, description, vpc_id=vpc_id,
@@ -169,6 +187,8 @@ def present(
     if not _ret['result']:
         ret['result'] = _ret['result']
         if ret['result'] is False:
+            return ret
+        elif ret['result'] is None:
             return ret
     if rules is not None:
         _ret = _rules_present(name, rules, vpc_id=vpc_id, vpc_name=vpc_name,
@@ -220,9 +240,9 @@ def _security_group_present(name, description, vpc_id=None, vpc_name=None,
                                                    profile=profile)
         if created:
             ret['changes']['old'] = {'secgroup': None}
-            sg = __salt__['boto_secgroup.get_config'](name, None, region, key,
-                                                      keyid, profile, vpc_id,
-                                                      vpc_name)
+            sg = __salt__['boto_secgroup.get_config'](name=name, group_id=None, region=region, key=key,
+                                              keyid=keyid, profile=profile, vpc_id=vpc_id,
+                                              vpc_name=vpc_name)
             ret['changes']['new'] = {'secgroup': sg}
             ret['comment'] = 'Security group {0} created.'.format(name)
         else:
@@ -314,13 +334,15 @@ def _get_rule_changes(rules, _rules):
     # 2. determine if rule exists in existing security group rules
     for rule in rules:
         try:
-            ip_protocol = rule.get('ip_protocol')
+            ip_protocol = str(rule.get('ip_protocol'))
         except KeyError:
             raise SaltInvocationError('ip_protocol, to_port, and from_port are'
                                       ' required arguments for security group'
                                       ' rules.')
-        supported_protocols = ['tcp', 'udp', 'icmp', 'all', '-1']
-        if ip_protocol not in supported_protocols:
+        supported_protocols = ['tcp', '6', 6, 'udp', '17', 17, 'icmp', '1', 1,
+                               'all', '-1', -1]
+        if ip_protocol not in supported_protocols and (not
+              '{0}'.format(ip_protocol).isdigit() or int(ip_protocol) > 255):
             msg = ('Invalid ip_protocol {0} specified in security group rule.')
             raise SaltInvocationError(msg.format(ip_protocol))
         # For the 'all' case, we need to change the protocol name to '-1'.
@@ -376,8 +398,9 @@ def _rules_present(name, rules, vpc_id=None, vpc_name=None,
     3. return 'old' and 'new' group rules
     '''
     ret = {'result': True, 'comment': '', 'changes': {}}
-    sg = __salt__['boto_secgroup.get_config'](name, None, region, key, keyid,
-                                              profile, vpc_id, vpc_name)
+    sg = __salt__['boto_secgroup.get_config'](name=name, group_id=None, region=region, key=key,
+                                              keyid=keyid, profile=profile, vpc_id=vpc_id,
+                                              vpc_name=vpc_name)
     if not sg:
         msg = '{0} security group configuration could not be retrieved.'
         ret['comment'] = msg.format(name)
@@ -403,7 +426,9 @@ def _rules_present(name, rules, vpc_id=None, vpc_name=None,
     to_delete, to_create = _get_rule_changes(rules, sg['rules'])
     if to_create or to_delete:
         if __opts__['test']:
-            msg = 'Security group {0} set to have rules modified.'.format(name)
+            msg = """Security group {0} set to have rules modified.
+            To be created: {1}
+            To be deleted: {2}""".format(name, pprint.pformat(to_create), pprint.pformat(to_delete))
             ret['comment'] = msg
             ret['result'] = None
             return ret
@@ -438,9 +463,9 @@ def _rules_present(name, rules, vpc_id=None, vpc_name=None,
                 ret['comment'] = ' '.join([ret['comment'], msg.format(name)])
                 ret['result'] = False
         ret['changes']['old'] = {'rules': sg['rules']}
-        sg = __salt__['boto_secgroup.get_config'](
-            name, None, region, key, keyid, profile, vpc_id, vpc_name
-        )
+        sg = __salt__['boto_secgroup.get_config'](name=name, group_id=None, region=region, key=key,
+                                                  keyid=keyid, profile=profile, vpc_id=vpc_id,
+                                                  vpc_name=vpc_name)
         ret['changes']['new'] = {'rules': sg['rules']}
     return ret
 
@@ -454,8 +479,9 @@ def _rules_egress_present(name, rules_egress, vpc_id=None, vpc_name=None,
     3. return 'old' and 'new' group rules
     '''
     ret = {'result': True, 'comment': '', 'changes': {}}
-    sg = __salt__['boto_secgroup.get_config'](name, None, region, key, keyid,
-                                              profile, vpc_id, vpc_name)
+    sg = __salt__['boto_secgroup.get_config'](name=name, group_id=None, region=region, key=key,
+                                              keyid=keyid, profile=profile, vpc_id=vpc_id,
+                                              vpc_name=vpc_name)
     if not sg:
         msg = '{0} security group configuration could not be retrieved.'
         ret['comment'] = msg.format(name)
@@ -483,7 +509,9 @@ def _rules_egress_present(name, rules_egress, vpc_id=None, vpc_name=None,
     )
     if to_create_egress or to_delete_egress:
         if __opts__['test']:
-            msg = 'Security group {0} set to have rules modified.'.format(name)
+            msg = """Security group {0} set to have rules modified.
+            To be created: {1}
+            To be deleted: {2}""".format(name, pprint.pformat(to_create_egress), pprint.pformat(to_delete_egress))
             ret['comment'] = msg
             ret['result'] = None
             return ret
@@ -519,9 +547,9 @@ def _rules_egress_present(name, rules_egress, vpc_id=None, vpc_name=None,
                 ret['result'] = False
 
         ret['changes']['old'] = {'rules_egress': sg['rules_egress']}
-        sg = __salt__['boto_secgroup.get_config'](
-            name, None, region, key, keyid, profile, vpc_id, vpc_name
-        )
+        sg = __salt__['boto_secgroup.get_config'](name=name, group_id=None, region=region, key=key,
+                                                  keyid=keyid, profile=profile, vpc_id=vpc_id,
+                                                  vpc_name=vpc_name)
         ret['changes']['new'] = {'rules_egress': sg['rules_egress']}
     return ret
 
@@ -546,7 +574,7 @@ def absent(
     vpc_name
         The name of the VPC to remove the security group from, if any. Exclusive with vpc_name.
 
-        .. versionadded:: Boron
+        .. versionadded:: 2016.3.0
 
     region
         Region to connect to.
@@ -561,20 +589,23 @@ def absent(
         A dict with region, key and keyid, or a pillar key (string)
         that contains a dict with region, key and keyid.
 
-        .. versionadded:: Boron
+        .. versionadded:: 2016.3.0
     '''
     ret = {'name': name, 'result': True, 'comment': '', 'changes': {}}
 
-    sg = __salt__['boto_secgroup.get_config'](name, True, region, key, keyid,
-                                              profile, vpc_id, vpc_name)
+    sg = __salt__['boto_secgroup.get_config'](name=name, group_id=None, region=region, key=key,
+                                              keyid=keyid, profile=profile, vpc_id=vpc_id,
+                                              vpc_name=vpc_name)
+
     if sg:
         if __opts__['test']:
             msg = 'Security group {0} is set to be removed.'.format(name)
             ret['comment'] = msg
             ret['result'] = None
             return ret
-        deleted = __salt__['boto_secgroup.delete'](name, None, region, key,
-                                                   keyid, profile, vpc_id, vpc_name)
+        deleted = __salt__['boto_secgroup.delete'](name=name, group_id=None, region=region, key=key,
+                                                   keyid=keyid, profile=profile, vpc_id=vpc_id,
+                                                   vpc_name=vpc_name)
         if deleted:
             ret['changes']['old'] = {'secgroup': sg}
             ret['changes']['new'] = {'secgroup': None}
@@ -595,13 +626,19 @@ def _tags_present(name, tags, vpc_id=None, vpc_name=None, region=None,
     '''
     ret = {'result': True, 'comment': '', 'changes': {}}
     if tags:
-        sg = __salt__['boto_secgroup.get_config'](name, None, region, key,
-                                                  keyid, profile, vpc_id, vpc_name)
+        sg = __salt__['boto_secgroup.get_config'](name=name, group_id=None, region=region, key=key,
+                                                  keyid=keyid, profile=profile, vpc_id=vpc_id,
+                                                  vpc_name=vpc_name)
+        if not sg:
+            msg = '{0} security group configuration could not be retrieved.'
+            ret['comment'] = msg.format(name)
+            ret['result'] = False
+            return ret
         tags_to_add = tags
         tags_to_update = {}
         tags_to_remove = []
         if sg.get('tags'):
-            for existing_tag in sg['tags'].keys():
+            for existing_tag in sg['tags']:
                 if existing_tag not in tags:
                     if existing_tag not in tags_to_remove:
                         tags_to_remove.append(existing_tag)

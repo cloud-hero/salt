@@ -9,7 +9,6 @@ import contextlib
 import copy
 import collections
 import datetime
-import distutils.version  # pylint: disable=import-error,no-name-in-module
 import errno
 import fnmatch
 import hashlib
@@ -18,7 +17,6 @@ import json
 import logging
 import numbers
 import os
-import pprint
 import random
 import re
 import shlex
@@ -33,6 +31,7 @@ import types
 import warnings
 import string
 import subprocess
+import getpass
 
 # Import 3rd-party libs
 from salt.ext import six
@@ -86,6 +85,12 @@ except ImportError:
     HAS_WIN32API = False
 
 try:
+    import salt.utils.win_functions
+    HAS_WIN_FUNCTIONS = True
+except ImportError:
+    HAS_WIN_FUNCTIONS = False
+
+try:
     import grp
     HAS_GRP = True
 except ImportError:
@@ -111,20 +116,22 @@ try:
     libc = ctypes.cdll.LoadLibrary(ctypes.util.find_library("c"))
     res_init = libc.__res_init
     HAS_RESINIT = True
-except (ImportError, OSError, AttributeError):
+except (ImportError, OSError, AttributeError, TypeError):
     HAS_RESINIT = False
 
 # Import salt libs
 from salt.defaults import DEFAULT_TARGET_DELIM
 import salt.defaults.exitcodes
 import salt.log
+import salt.utils.dictupdate
 import salt.version
 from salt.utils.decorators import memoize as real_memoize
+from salt.utils.versions import LooseVersion as _LooseVersion
 from salt.textformat import TextFormat
 from salt.exceptions import (
     CommandExecutionError, SaltClientError,
     CommandNotFoundError, SaltSystemExit,
-    SaltInvocationError
+    SaltInvocationError, SaltException
 )
 
 
@@ -150,6 +157,17 @@ def is_empty(filename):
         return os.stat(filename).st_size == 0
     except OSError:
         # Non-existent file or permission denied to the parent dir
+        return False
+
+
+def is_hex(value):
+    '''
+    Returns True if value is a hexidecimal string, otherwise returns False
+    '''
+    try:
+        int(value, 16)
+        return True
+    except (TypeError, ValueError):
         return False
 
 
@@ -272,8 +290,10 @@ def get_user():
     '''
     if HAS_PWD:
         return pwd.getpwuid(os.geteuid()).pw_name
+    elif HAS_WIN_FUNCTIONS and salt.utils.win_functions.HAS_WIN32:
+        return salt.utils.win_functions.get_current_user()
     else:
-        return win32api.GetUserName()
+        raise CommandExecutionError("Required external libraries not found. Need 'pwd' or 'win32api")
 
 
 def get_uid(user=None):
@@ -397,6 +417,31 @@ def get_specific_user():
     return user
 
 
+def get_master_key(key_user, opts, skip_perm_errors=False):
+    if key_user == 'root':
+        if opts.get('user', 'root') != 'root':
+            key_user = opts.get('user', 'root')
+    if key_user.startswith('sudo_'):
+        key_user = opts.get('user', 'root')
+    if salt.utils.is_windows():
+        # The username may contain '\' if it is in Windows
+        # 'DOMAIN\username' format. Fix this for the keyfile path.
+        key_user = key_user.replace('\\', '_')
+    keyfile = os.path.join(opts['cachedir'],
+                           '.{0}_key'.format(key_user))
+    # Make sure all key parent directories are accessible
+    salt.utils.verify.check_path_traversal(opts['cachedir'],
+                                           key_user,
+                                           skip_perm_errors)
+
+    try:
+        with salt.utils.fopen(keyfile, 'r') as key:
+            return key.read()
+    except (OSError, IOError):
+        # Fall back to eauth
+        return ''
+
+
 def reinit_crypto():
     '''
     When a fork arrises, pycrypto needs to reinit
@@ -455,9 +500,14 @@ def daemonize(redirect_out=True):
     # multiprocessing process attempts to access stdout or err.
     if redirect_out:
         with fopen('/dev/null', 'r+') as dev_null:
+            # Redirect python stdin/out/err
+            # and the os stdin/out/err which can be different
             os.dup2(dev_null.fileno(), sys.stdin.fileno())
             os.dup2(dev_null.fileno(), sys.stdout.fileno())
             os.dup2(dev_null.fileno(), sys.stderr.fileno())
+            os.dup2(dev_null.fileno(), 0)
+            os.dup2(dev_null.fileno(), 1)
+            os.dup2(dev_null.fileno(), 2)
 
 
 def daemonize_if(opts):
@@ -503,7 +553,7 @@ def rand_str(size=9999999999, hash_type=None):
     if not hash_type:
         hash_type = 'md5'
     hasher = getattr(hashlib, hash_type)
-    return hasher(str(random.SystemRandom().randint(0, size))).hexdigest()
+    return hasher(to_bytes(str(random.SystemRandom().randint(0, size)))).hexdigest()
 
 
 def which(exe=None):
@@ -520,11 +570,7 @@ def which(exe=None):
             # executable in cwd or fullpath
             return exe
 
-        # default path based on busybox's default
-        default_path = '/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin'
-        search_path = os.environ.get('PATH', default_path)
-        path_ext = os.environ.get('PATHEXT', '.EXE')
-        ext_list = path_ext.split(';')
+        ext_list = os.environ.get('PATHEXT', '.EXE').split(';')
 
         @real_memoize
         def _exe_has_ext():
@@ -541,7 +587,13 @@ def which(exe=None):
                     continue
             return False
 
-        search_path = search_path.split(os.pathsep)
+        # Enhance POSIX path for the reliability at some environments, when $PATH is changing
+        # This also keeps order, where 'first came, first win' for cases to find optional alternatives
+        search_path = os.environ.get('PATH') and os.environ['PATH'].split(os.pathsep) or list()
+        for default_path in ['/bin', '/sbin', '/usr/bin', '/usr/sbin', '/usr/local/bin']:
+            if default_path not in search_path:
+                search_path.append(default_path)
+        os.environ['PATH'] = os.pathsep.join(search_path)
         for path in search_path:
             full_path = os.path.join(path, exe)
             if _is_executable_file_or_link(full_path):
@@ -554,16 +606,10 @@ def which(exe=None):
                     # safely rely on that behavior
                     if _is_executable_file_or_link(full_path + ext):
                         return full_path + ext
-        log.trace(
-            '\'{0}\' could not be found in the following search '
-            'path: \'{1}\''.format(
-                exe, search_path
-            )
-        )
+        log.trace('\'{0}\' could not be found in the following search path: \'{1}\''.format(exe, search_path))
     else:
-        log.error(
-            'No executable was passed to be searched by salt.utils.which()'
-        )
+        log.error('No executable was passed to be searched by salt.utils.which()')
+
     return None
 
 
@@ -606,7 +652,7 @@ def output_profile(pr, stats_path='/tmp/stats', stop=False, id_=None):
             ficn = os.path.join(stats_path, '{0}.{1}.stats'.format(id_, date))
             if not os.path.exists(ficp):
                 pr.dump_stats(ficp)
-                with open(ficn, 'w') as fic:
+                with fopen(ficn, 'w') as fic:
                     pstats.Stats(pr, stream=fic).sort_stats('cumulative')
             log.info('PROFILING: {0} generated'.format(ficp))
             log.info('PROFILING (cumulative): {0} generated'.format(ficn))
@@ -709,12 +755,16 @@ def ip_bracket(addr):
     return addr
 
 
-def dns_check(addr, safe=False, ipv6=False):
+def dns_check(addr, port, safe=False, ipv6=None):
     '''
     Return the ip resolved by dns, but do not exit on failure, only raise an
     exception. Obeys system preference for IPv4/6 address resolution.
+    Tries to connect to the address before considering it useful. If no address
+    can be reached, the first one resolved is used as a fallback.
     '''
     error = False
+    lookup = addr
+    seen_ipv6 = False
     try:
         # issue #21397: force glibc to re-read resolv.conf
         if HAS_RESINIT:
@@ -725,21 +775,46 @@ def dns_check(addr, safe=False, ipv6=False):
         if not hostnames:
             error = True
         else:
-            addr = False
+            resolved = False
+            candidates = []
             for h in hostnames:
-                if h[0] == socket.AF_INET or (h[0] == socket.AF_INET6 and ipv6):
-                    addr = ip_bracket(h[4][0])
+                # It's an IP address, just return it
+                if h[4][0] == addr:
+                    resolved = addr
                     break
-            if not addr:
-                error = True
+
+                if h[0] == socket.AF_INET and ipv6 is True:
+                    continue
+                if h[0] == socket.AF_INET6 and ipv6 is False:
+                    continue
+
+                candidate_addr = ip_bracket(h[4][0])
+
+                if h[0] != socket.AF_INET6 or ipv6 is not None:
+                    candidates.append(candidate_addr)
+
+                s = socket.socket(h[0], socket.SOCK_STREAM)
+                try:
+                    s.connect((candidate_addr.strip('[]'), port))
+                    s.close()
+
+                    resolved = candidate_addr
+                    break
+                except socket.error:
+                    pass
+            if not resolved:
+                if len(candidates) > 0:
+                    resolved = candidates[0]
+                else:
+                    error = True
     except TypeError:
-        err = ('Attempt to resolve address \'{0}\' failed. Invalid or unresolveable address').format(addr)
+        err = ('Attempt to resolve address \'{0}\' failed. Invalid or unresolveable address').format(lookup)
         raise SaltSystemExit(code=42, msg=err)
     except socket.error:
         error = True
 
     if error:
-        err = ('DNS lookup of \'{0}\' failed.').format(addr)
+        err = ('DNS lookup or connection check of \'{0}\' failed.').format(addr)
         if safe:
             if salt.log.is_console_configured():
                 # If logging is not configured it also means that either
@@ -748,7 +823,7 @@ def dns_check(addr, safe=False, ipv6=False):
                 log.error(err)
             raise SaltClientError()
         raise SaltSystemExit(code=42, msg=err)
-    return addr
+    return resolved
 
 
 def required_module_list(docstring=None):
@@ -805,7 +880,7 @@ def check_or_die(command):
         raise CommandNotFoundError('\'None\' is not a valid command.')
 
     if not which(command):
-        raise CommandNotFoundError(command)
+        raise CommandNotFoundError('\'{0}\' is not in the path'.format(command))
 
 
 def backup_minion(path, bkroot):
@@ -845,27 +920,53 @@ def path_join(*parts):
     See tests/unit/utils/path_join_test.py for some examples on what's being
     talked about here.
     '''
+    if six.PY3:
+        new_parts = []
+        for part in parts:
+            new_parts.append(to_str(part))
+        parts = new_parts
     # Normalize path converting any os.sep as needed
     parts = [os.path.normpath(p) for p in parts]
 
-    root = parts.pop(0)
+    try:
+        root = parts.pop(0)
+    except IndexError:
+        # No args passed to func
+        return ''
+
     if not parts:
-        return root
+        ret = root
+    else:
+        if is_windows():
+            if len(root) == 1:
+                root += ':'
+            root = root.rstrip(os.sep) + os.sep
 
-    if is_windows():
-        if len(root) == 1:
-            root += ':'
-        root = root.rstrip(os.sep) + os.sep
+        stripped = [p.lstrip(os.sep) for p in parts]
+        try:
+            ret = os.path.join(root, *stripped)
+        except UnicodeDecodeError:
+            # This is probably Python 2 and one of the parts contains unicode
+            # characters in a bytestring. First try to decode to the system
+            # encoding.
+            try:
+                enc = __salt_system_encoding__
+            except NameError:
+                enc = sys.stdin.encoding or sys.getdefaultencoding()
+            try:
+                ret = os.path.join(root.decode(enc),
+                                   *[x.decode(enc) for x in stripped])
+            except UnicodeDecodeError:
+                # Last resort, try UTF-8
+                ret = os.path.join(root.decode('UTF-8'),
+                                   *[x.decode('UTF-8') for x in stripped])
+    return os.path.normpath(ret)
 
-    return os.path.normpath(os.path.join(
-        root, *[p.lstrip(os.sep) for p in parts]
-    ))
 
-
-def pem_finger(path=None, key=None, sum_type='md5'):
+def pem_finger(path=None, key=None, sum_type='sha256'):
     '''
     Pass in either a raw pem string, or the path on disk to the location of a
-    pem file, and the type of cryptographic hash to use. The default is md5.
+    pem file, and the type of cryptographic hash to use. The default is SHA256.
     The fingerprint of the pem will be returned.
 
     If neither a key nor a path are passed in, a blank string will be returned.
@@ -875,7 +976,7 @@ def pem_finger(path=None, key=None, sum_type='md5'):
             return ''
 
         with fopen(path, 'rb') as fp_:
-            key = ''.join(fp_.readlines()[1:-1])
+            key = b''.join([x for x in fp_.readlines() if x.strip()][1:-1])
 
     pre = getattr(hashlib, sum_type)(key).hexdigest()
     finger = ''
@@ -937,7 +1038,8 @@ def build_whitespace_split_regex(text):
 def format_call(fun,
                 data,
                 initial_ret=None,
-                expected_extra_kws=()):
+                expected_extra_kws=(),
+                is_class_method=None):
     '''
     Build the required arguments and keyword arguments required for the passed
     function.
@@ -949,6 +1051,13 @@ def format_call(fun,
                         None
     :param expected_extra_kws: Any expected extra keyword argument names which
                                should not trigger a :ref:`SaltInvocationError`
+    :param is_class_method: Pass True if you are sure that the function being passed
+                            is a class method. The reason for this is that on Python 3
+                            ``inspect.ismethod`` only returns ``True`` for bound methods,
+                            while on Python 2, it returns ``True`` for bound and unbound
+                            methods. So, on Python 3, in case of a class method, you'd
+                            need the class to which the function belongs to be instantiated
+                            and this is not always wanted.
     :returns: A dictionary with the function required arguments and keyword
               arguments.
     '''
@@ -957,9 +1066,9 @@ def format_call(fun,
     ret['args'] = []
     ret['kwargs'] = {}
 
-    aspec = salt.utils.args.get_function_argspec(fun)
+    aspec = salt.utils.args.get_function_argspec(fun, is_class_method=is_class_method)
 
-    arg_data = arg_lookup(fun)
+    arg_data = arg_lookup(fun, aspec)
     args = arg_data['args']
     kwargs = arg_data['kwargs']
 
@@ -1016,10 +1125,10 @@ def format_call(fun,
             continue
         extra[key] = copy.deepcopy(value)
 
-    # We'll be showing errors to the users until Salt Carbon comes out, after
+    # We'll be showing errors to the users until Salt Oxygen comes out, after
     # which, errors will be raised instead.
     warn_until(
-        'Carbon',
+        'Oxygen',
         'It\'s time to start raising `SaltInvocationError` instead of '
         'returning warnings',
         # Let's not show the deprecation warning on the console, there's no
@@ -1056,7 +1165,7 @@ def format_call(fun,
             '{0}. If you were trying to pass additional data to be used '
             'in a template context, please populate \'context\' with '
             '\'key: value\' pairs. Your approach will work until Salt '
-            'Carbon is out.{1}'.format(
+            'Oxygen is out.{1}'.format(
                 msg,
                 '' if 'full' not in ret else ' Please update your state files.'
             )
@@ -1067,13 +1176,14 @@ def format_call(fun,
     return ret
 
 
-def arg_lookup(fun):
+def arg_lookup(fun, aspec=None):
     '''
     Return a dict containing the arguments and default arguments to the
     function.
     '''
     ret = {'kwargs': {}}
-    aspec = salt.utils.args.get_function_argspec(fun)
+    if aspec is None:
+        aspec = salt.utils.args.get_function_argspec(fun)
     if aspec.defaults:
         ret['kwargs'] = dict(zip(aspec.args[::-1], aspec.defaults[::-1]))
     ret['args'] = [arg for arg in aspec.args if arg not in ret['kwargs']]
@@ -1196,21 +1306,38 @@ def fopen(*args, **kwargs):
     NB! We still have small race condition between open and fcntl.
 
     '''
-    # ensure 'binary' mode is always used on windows
-    if kwargs.pop('binary', True):
-        if is_windows():
-            if len(args) > 1:
-                args = list(args)
-                if 'b' not in args[1]:
-                    args[1] += 'b'
-            elif kwargs.get('mode', None):
-                if 'b' not in kwargs['mode']:
-                    kwargs['mode'] += 'b'
-            else:
-                # the default is to read
-                kwargs['mode'] = 'rb'
+    # ensure 'binary' mode is always used on Windows in Python 2
+    if ((six.PY2 and is_windows() and 'binary' not in kwargs) or
+            kwargs.pop('binary', False)):
+        if len(args) > 1:
+            args = list(args)
+            if 'b' not in args[1]:
+                args[1] += 'b'
+        elif kwargs.get('mode', None):
+            if 'b' not in kwargs['mode']:
+                kwargs['mode'] += 'b'
+        else:
+            # the default is to read
+            kwargs['mode'] = 'rb'
+    elif six.PY3 and 'encoding' not in kwargs:
+        # In Python 3, if text mode is used and the encoding
+        # is not specified, set the encoding to 'utf-8'.
+        binary = False
+        if len(args) > 1:
+            args = list(args)
+            if 'b' in args[1]:
+                binary = True
+        if kwargs.get('mode', None):
+            if 'b' in kwargs['mode']:
+                binary = True
+        if not binary:
+            kwargs['encoding'] = __salt_system_encoding__
+
+    if six.PY3 and not binary and not kwargs.get('newline', None):
+        kwargs['newline'] = ''
 
     fhandle = open(*args, **kwargs)
+
     if is_fcntl_available():
         # modify the file descriptor on systems with fcntl
         # unix and unix-like systems only
@@ -1305,43 +1432,39 @@ def check_whitelist_blacklist(value, whitelist=None, blacklist=None):
     '''
     Check a whitelist and/or blacklist to see if the value matches it.
     '''
-    if not any((whitelist, blacklist)):
-        return True
-    in_whitelist = False
-    in_blacklist = False
-    if whitelist:
-        try:
-            for expr in whitelist:
-                if expr_match(value, expr):
-                    in_whitelist = True
-                    break
-        except TypeError:
-            log.error('Non-iterable whitelist {0}'.format(whitelist))
-            whitelist = None
-    else:
-        whitelist = None
-
-    if blacklist:
+    if blacklist is not None:
+        if not hasattr(blacklist, '__iter__'):
+            blacklist = [blacklist]
         try:
             for expr in blacklist:
                 if expr_match(value, expr):
-                    in_blacklist = True
-                    break
+                    return False
         except TypeError:
-            log.error('Non-iterable blacklist {0}'.format(whitelist))
-            blacklist = None
-    else:
-        blacklist = None
+            log.error('Non-iterable blacklist {0}'.format(blacklist))
 
-    if whitelist and not blacklist:
-        ret = in_whitelist
-    elif blacklist and not whitelist:
-        ret = not in_blacklist
-    elif whitelist and blacklist:
-        ret = in_whitelist and not in_blacklist
+    if whitelist:
+        if not hasattr(whitelist, '__iter__'):
+            whitelist = [whitelist]
+        try:
+            for expr in whitelist:
+                if expr_match(value, expr):
+                    return True
+        except TypeError:
+            log.error('Non-iterable whitelist {0}'.format(whitelist))
     else:
-        ret = True
+        return True
 
+    return False
+
+
+def get_values_of_matching_keys(pattern_dict, user_name):
+    '''
+    Check a whitelist and/or blacklist to see if the value matches it.
+    '''
+    ret = []
+    for expr in pattern_dict:
+        if expr_match(user_name, expr):
+            ret.extend(pattern_dict[expr])
     return ret
 
 
@@ -1370,7 +1493,8 @@ def subdict_match(data,
             return fnmatch.fnmatch(str(target).lower(), pattern.lower())
 
     def _dict_match(target, pattern, regex_match=False, exact_match=False):
-        if pattern.startswith('*:'):
+        wildcard = pattern.startswith('*:')
+        if wildcard:
             pattern = pattern[2:]
 
         if pattern == '*':
@@ -1380,29 +1504,30 @@ def subdict_match(data,
             # We might want to search for a key
             return True
         elif subdict_match(target,
-                         pattern,
-                         regex_match=regex_match,
-                         exact_match=exact_match):
+                           pattern,
+                           regex_match=regex_match,
+                           exact_match=exact_match):
             return True
-        for key in target.keys():
-            if _match(key,
-                      pattern,
-                      regex_match=regex_match,
-                      exact_match=exact_match):
-                return True
-            if isinstance(target[key], dict):
-                if _dict_match(target[key],
-                               pattern,
-                               regex_match=regex_match,
-                               exact_match=exact_match):
+        if wildcard:
+            for key in target:
+                if _match(key,
+                          pattern,
+                          regex_match=regex_match,
+                          exact_match=exact_match):
                     return True
-            elif isinstance(target[key], list):
-                for item in target[key]:
-                    if _match(item,
-                              pattern,
-                              regex_match=regex_match,
-                              exact_match=exact_match):
+                if isinstance(target[key], dict):
+                    if _dict_match(target[key],
+                                   pattern,
+                                   regex_match=regex_match,
+                                   exact_match=exact_match):
                         return True
+                elif isinstance(target[key], list):
+                    for item in target[key]:
+                        if _match(item,
+                                  pattern,
+                                  regex_match=regex_match,
+                                  exact_match=exact_match):
+                            return True
         return False
 
     for idx in range(1, expr.count(delimiter) + 1):
@@ -1444,7 +1569,7 @@ def subdict_match(data,
     return False
 
 
-def traverse_dict(data, key, default, delimiter=DEFAULT_TARGET_DELIM):
+def traverse_dict(data, key, default=None, delimiter=DEFAULT_TARGET_DELIM):
     '''
     Traverse a dict using a colon-delimited (or otherwise delimited, using the
     'delimiter' param) target string. The target 'foo:bar:baz' will return
@@ -1460,7 +1585,7 @@ def traverse_dict(data, key, default, delimiter=DEFAULT_TARGET_DELIM):
     return data
 
 
-def traverse_dict_and_list(data, key, default, delimiter=DEFAULT_TARGET_DELIM):
+def traverse_dict_and_list(data, key, default=None, delimiter=DEFAULT_TARGET_DELIM):
     '''
     Traverse a dict or list using a colon-delimited (or otherwise delimited,
     using the 'delimiter' param) target string. The target 'foo:bar:0' will
@@ -1501,22 +1626,6 @@ def traverse_dict_and_list(data, key, default, delimiter=DEFAULT_TARGET_DELIM):
     return data
 
 
-def mkstemp(*args, **kwargs):
-    '''
-    Helper function which does exactly what `tempfile.mkstemp()` does but
-    accepts another argument, `close_fd`, which, by default, is true and closes
-    the fd before returning the file path. Something commonly done throughout
-    Salt's code.
-    '''
-    close_fd = kwargs.pop('close_fd', True)
-    fd_, fpath = tempfile.mkstemp(*args, **kwargs)
-    if close_fd is False:
-        return (fd_, fpath)
-    os.close(fd_)
-    del fd_
-    return fpath
-
-
 def clean_kwargs(**kwargs):
     '''
     Return a dict without any of the __pub* keys (or any other keys starting
@@ -1546,7 +1655,7 @@ def sanitize_win_path_string(winpath):
     '''
     intab = '<>:|?*'
     outtab = '_' * len(intab)
-    trantab = ''.maketrans(intab, outtab) if six.PY3 else string.maketrans(intab, outtab)
+    trantab = ''.maketrans(intab, outtab) if six.PY3 else string.maketrans(intab, outtab)  # pylint: disable=no-member
     if isinstance(winpath, str):
         winpath = winpath.translate(trantab)
     elif isinstance(winpath, six.text_type):
@@ -1588,7 +1697,7 @@ def is_linux():
 @real_memoize
 def is_darwin():
     '''
-    Simple function to return if a host is Darwin (OS X) or not
+    Simple function to return if a host is Darwin (macOS) or not
     '''
     return sys.platform.startswith('darwin')
 
@@ -1667,11 +1776,27 @@ def is_freebsd():
 
 
 @real_memoize
+def is_netbsd():
+    '''
+    Simple function to return if host is NetBSD or not
+    '''
+    return sys.platform.startswith('netbsd')
+
+
+@real_memoize
 def is_openbsd():
     '''
     Simple function to return if host is OpenBSD or not
     '''
     return sys.platform.startswith('openbsd')
+
+
+@real_memoize
+def is_aix():
+    '''
+    Simple function to return if host is AIX or not
+    '''
+    return sys.platform.startswith('aix')
 
 
 def is_fcntl_available(check_sunos=False):
@@ -1743,7 +1868,100 @@ def gen_state_tag(low):
     return '{0[state]}_|-{0[__id__]}_|-{0[name]}_|-{0[fun]}'.format(low)
 
 
-def check_state_result(running):
+def search_onfail_requisites(sid, highstate):
+    """
+    For a particular low chunk, search relevant onfail related
+    states
+    """
+    onfails = []
+    if '_|-' in sid:
+        st = salt.state.split_low_tag(sid)
+    else:
+        st = {'__id__': sid}
+    for fstate, fchunks in six.iteritems(highstate):
+        if fstate == st['__id__']:
+            continue
+        else:
+            for mod_, fchunk in six.iteritems(fchunks):
+                if (
+                    not isinstance(mod_, six.string_types) or
+                    mod_.startswith('__')
+                ):
+                    continue
+                else:
+                    if not isinstance(fchunk, list):
+                        continue
+                    else:
+                        for fdata in fchunk:
+                            if not isinstance(fdata, dict):
+                                continue
+                            # bydefault onfail will fail, but you can
+                            # set onfail_stop: False to prevent the highstate
+                            # to stop if you handle it
+                            if fdata.get('onfail_stop', True):
+                                continue
+                            for knob, fvalue in six.iteritems(fdata):
+                                if knob != 'onfail':
+                                    continue
+                                for freqs in fvalue:
+                                    for fmod, fid in six.iteritems(freqs):
+                                        if not (
+                                            fid == st['__id__'] and
+                                            fmod == st.get('state', fmod)
+                                        ):
+                                            continue
+                                        onfails.append((fstate, mod_, fchunk))
+    return onfails
+
+
+def check_onfail_requisites(state_id, state_result, running, highstate):
+    '''
+    When a state fail and is part of a highstate, check
+    if there is onfail requisites.
+    When we find onfail requisites, we will consider the state failed
+    only if at least one of those onfail requisites also failed
+
+    Returns:
+
+        True: if onfail handlers suceeded
+        False: if one on those handler failed
+        None: if the state does not have onfail requisites
+
+    '''
+    nret = None
+    if (
+        state_id and state_result and
+        highstate and isinstance(highstate, dict)
+    ):
+        onfails = search_onfail_requisites(state_id, highstate)
+        if onfails:
+            for handler in onfails:
+                fstate, mod_, fchunk = handler
+                ofresult = True
+                for rstateid, rstate in six.iteritems(running):
+                    if '_|-' in rstateid:
+                        st = salt.state.split_low_tag(rstateid)
+                    # in case of simple state, try to guess
+                    else:
+                        id_ = rstate.get('__id__', rstateid)
+                        if not id_:
+                            raise ValueError('no state id')
+                        st = {'__id__': id_, 'state': mod_}
+                    if mod_ == st['state'] and fstate == st['__id__']:
+                        ofresult = rstate.get('result', _empty)
+                        if ofresult in [False, True]:
+                            nret = ofresult
+                        if ofresult is False:
+                            # as soon as we find an errored onfail, we stop
+                            break
+                # consider that if we parsed onfailes without changing
+                # the ret, that we have failed
+                if nret is None:
+                    nret = False
+    return nret
+
+
+def check_state_result(running, recurse=False, highstate=None):
     '''
     Check the total return value of the run and determine if the running
     dict has any issues
@@ -1755,25 +1973,56 @@ def check_state_result(running):
         return False
 
     ret = True
-    for state_result in six.itervalues(running):
-        if not isinstance(state_result, dict):
-            # return false when hosts return a list instead of a dict
+    for state_id, state_result in six.iteritems(running):
+        if not recurse and not isinstance(state_result, dict):
             ret = False
-        if ret:
+        if ret and isinstance(state_result, dict):
             result = state_result.get('result', _empty)
             if result is False:
                 ret = False
             # only override return value if we are not already failed
-            elif (
-                result is _empty
-                and isinstance(state_result, dict)
-                and ret
-            ):
-                ret = check_state_result(state_result)
+            elif result is _empty and isinstance(state_result, dict) and ret:
+                ret = check_state_result(
+                    state_result, recurse=True, highstate=highstate)
+        # if we detect a fail, check for onfail requisites
+        if not ret:
+            # ret can be None in case of no onfail reqs, recast it to bool
+            ret = bool(check_onfail_requisites(state_id, state_result,
+                                               running, highstate))
         # return as soon as we got a failure
         if not ret:
             break
     return ret
+
+
+def st_mode_to_octal(mode):
+    '''
+    Convert the st_mode value from a stat(2) call (as returned from os.stat())
+    to an octal mode.
+    '''
+    try:
+        return oct(mode)[-4:]
+    except (TypeError, IndexError):
+        return ''
+
+
+def normalize_mode(mode):
+    '''
+    Return a mode value, normalized to a string and containing a leading zero
+    if it does not have one.
+
+    Allow "keep" as a valid mode (used by file state/module to preserve mode
+    from the Salt fileserver in file states).
+    '''
+    if mode is None:
+        return None
+    if not isinstance(mode, six.string_types):
+        mode = str(mode)
+    if six.PY3:
+        mode = mode.replace('0o', '0')
+    # Strip any quotes any initial zeroes, then though zero-pad it up to 4.
+    # This ensures that somethign like '00644' is normalized to '0644'
+    return mode.strip('"').strip('\'').lstrip('0').zfill(4)
 
 
 def test_mode(**kwargs):
@@ -1829,6 +2078,9 @@ def exactly_n(l, n=1):
 
 
 def exactly_one(l):
+    '''
+    Check if only one item is not None, False, or 0 in an iterable.
+    '''
     return exactly_n(l)
 
 
@@ -1853,9 +2105,11 @@ def rm_rf(path):
             os.chmod(path, stat.S_IWUSR)
             func(path)
         else:
-            raise
-
-    shutil.rmtree(path, onerror=_onerror)
+            raise  # pylint: disable=E0704
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.remove(path)
+    else:
+        shutil.rmtree(path, onerror=_onerror)
 
 
 def option(value, default='', opts=None, pillar=None):
@@ -1982,7 +2236,7 @@ def safe_walk(top, topdown=True, onerror=None, followlinks=True, _seen=None):
         yield top, dirs, nondirs
 
 
-def get_hash(path, form='md5', chunk_size=65536):
+def get_hash(path, form='sha256', chunk_size=65536):
     '''
     Get the hash sum of a file
 
@@ -1992,10 +2246,10 @@ def get_hash(path, form='md5', chunk_size=65536):
             ``get_sum`` cannot really be trusted since it is vulnerable to
             collisions: ``get_sum(..., 'xyz') == 'Hash xyz not supported'``
     '''
-    try:
-        hash_type = getattr(hashlib, form)
-    except (AttributeError, TypeError):
+    hash_type = hasattr(hashlib, form) and getattr(hashlib, form) or None
+    if hash_type is None:
         raise ValueError('Invalid hash type: {0}'.format(form))
+
     with salt.utils.fopen(path, 'rb') as ifile:
         hash_obj = hash_type()
         # read the file in in chunks, not the entire file
@@ -2004,21 +2258,53 @@ def get_hash(path, form='md5', chunk_size=65536):
         return hash_obj.hexdigest()
 
 
-def namespaced_function(function, global_dict, defaults=None):
+def namespaced_function(function, global_dict, defaults=None, preserve_context=False):
     '''
-    Redefine(clone) a function under a different globals() namespace scope
+    Redefine (clone) a function under a different globals() namespace scope
+
+        preserve_context:
+            Allow to keep the context taken from orignal namespace,
+            and extend it with globals() taken from
+            new targetted namespace.
     '''
     if defaults is None:
         defaults = function.__defaults__
 
+    if preserve_context:
+        _global_dict = function.__globals__.copy()
+        _global_dict.update(global_dict)
+        global_dict = _global_dict
     new_namespaced_function = types.FunctionType(
         function.__code__,
         global_dict,
         name=function.__name__,
-        argdefs=defaults
+        argdefs=defaults,
+        closure=function.__closure__
     )
     new_namespaced_function.__dict__.update(function.__dict__)
     return new_namespaced_function
+
+
+def alias_function(fun, name, doc=None):
+    '''
+    Copy a function
+    '''
+    alias_fun = types.FunctionType(fun.__code__,
+                                   fun.__globals__,
+                                   name,
+                                   fun.__defaults__,
+                                   fun.__closure__)
+    alias_fun.__dict__.update(fun.__dict__)
+
+    if doc and isinstance(doc, six.string_types):
+        alias_fun.__doc__ = doc
+    else:
+        orig_name = fun.__name__
+        alias_msg = ('\nThis function is an alias of '
+                     '``{0}``.\n'.format(orig_name))
+        alias_fun.__doc__ = alias_msg + fun.__doc__
+
+    return alias_fun
 
 
 def _win_console_event_handler(event):
@@ -2066,8 +2352,8 @@ def date_cast(date):
         if HAS_TIMELIB:
             raise ValueError('Unable to parse {0}'.format(date))
 
-        raise RuntimeError('Unable to parse {0}.'
-            ' Consider installing timelib'.format(date))
+        raise RuntimeError(
+                'Unable to parse {0}. Consider installing timelib'.format(date))
 
 
 def date_format(date=None, format="%Y-%m-%d"):
@@ -2199,7 +2485,7 @@ def kwargs_warn_until(kwargs,
     This function is used to help deprecate unused legacy ``**kwargs`` that
     were added to function parameters lists to preserve backwards compatibility
     when removing a parameter. See
-    :doc:`the deprecation development docs </topics/development/deprecations>`
+    :ref:`the deprecation development docs <deprecations>`
     for the modern strategy for deprecating a function parameter.
 
     :param kwargs: The caller's ``**kwargs`` argument value (a ``dict``).
@@ -2246,7 +2532,7 @@ def kwargs_warn_until(kwargs,
             version,
             message='The following parameter(s) have been deprecated and '
                     'will be removed in \'{0}\': {1}.'.format(version.string,
-                                                            arg_names),
+                                                              arg_names),
             category=category,
             stacklevel=stacklevel,
             _version_info_=_version_.info,
@@ -2254,46 +2540,50 @@ def kwargs_warn_until(kwargs,
         )
 
 
-def version_cmp(pkg1, pkg2):
+def version_cmp(pkg1, pkg2, ignore_epoch=False):
     '''
-    Compares two version strings using distutils.version.LooseVersion. This is
+    Compares two version strings using salt.utils.versions.LooseVersion. This is
     a fallback for providers which don't have a version comparison utility
     built into them.  Return -1 if version1 < version2, 0 if version1 ==
     version2, and 1 if version1 > version2. Return None if there was a problem
     making the comparison.
     '''
+    normalize = lambda x: str(x).split(':', 1)[-1] if ignore_epoch else str(x)
+    pkg1 = normalize(pkg1)
+    pkg2 = normalize(pkg2)
+
     try:
         # pylint: disable=no-member
-        if distutils.version.LooseVersion(pkg1) < \
-                distutils.version.LooseVersion(pkg2):
+        if _LooseVersion(pkg1) < _LooseVersion(pkg2):
             return -1
-        elif distutils.version.LooseVersion(pkg1) == \
-                distutils.version.LooseVersion(pkg2):
+        elif _LooseVersion(pkg1) == _LooseVersion(pkg2):
             return 0
-        elif distutils.version.LooseVersion(pkg1) > \
-                distutils.version.LooseVersion(pkg2):
+        elif _LooseVersion(pkg1) > _LooseVersion(pkg2):
             return 1
     except Exception as exc:
         log.exception(exc)
     return None
 
 
-def compare_versions(ver1='', oper='==', ver2='', cmp_func=None):
+def compare_versions(ver1='',
+                     oper='==',
+                     ver2='',
+                     cmp_func=None,
+                     ignore_epoch=False):
     '''
     Compares two version numbers. Accepts a custom function to perform the
     cmp-style version comparison, otherwise uses version_cmp().
     '''
     cmp_map = {'<': (-1,), '<=': (-1, 0), '==': (0,),
                '>=': (0, 1), '>': (1,)}
-    if oper not in ['!='] and oper not in cmp_map:
-        log.error('Invalid operator "{0}" for version '
-                  'comparison'.format(oper))
+    if oper not in ('!=',) and oper not in cmp_map:
+        log.error('Invalid operator \'%s\' for version comparison', oper)
         return False
 
     if cmp_func is None:
         cmp_func = version_cmp
 
-    cmp_result = cmp_func(ver1, ver2)
+    cmp_result = cmp_func(ver1, ver2, ignore_epoch=ignore_epoch)
     if cmp_result is None:
         return False
 
@@ -2337,27 +2627,29 @@ def compare_dicts(old=None, new=None):
     return ret
 
 
+def compare_lists(old=None, new=None):
+    '''
+    Compare before and after results from various salt functions, returning a
+    dict describing the changes that were made
+    '''
+    ret = dict()
+    for item in new:
+        if item not in old:
+            ret['new'] = item
+    for item in old:
+        if item not in new:
+            ret['old'] = item
+    return ret
+
+
 def argspec_report(functions, module=''):
     '''
     Pass in a functions dict as it is returned from the loader and return the
     argspec function signatures
     '''
     ret = {}
-    # TODO: cp.get_file will also match cp.get_file_str. this is the
-    # same logic as sys.doc, and it is not working as expected, see
-    # issue #3614
-    _use_fnmatch = False
-    if '*' in module:
-        target_mod = module
-        _use_fnmatch = True
-    elif module:
-        # allow both "sys" and "sys." to match sys, without also matching
-        # sysctl
-        target_module = module + '.' if not module.endswith('.') else module
-    else:
-        target_module = ''
-    if _use_fnmatch:
-        for fun in fnmatch.filter(functions, target_mod):
+    if '*' in module or '.' in module:
+        for fun in fnmatch.filter(functions, module):
             try:
                 aspec = salt.utils.args.get_function_argspec(functions[fun])
             except TypeError:
@@ -2373,8 +2665,11 @@ def argspec_report(functions, module=''):
             ret[fun]['kwargs'] = True if kwargs else None
 
     else:
+        # "sys" should just match sys without also matching sysctl
+        moduledot = module + '.'
+
         for fun in functions:
-            if fun == module or fun.startswith(target_module):
+            if fun.startswith(moduledot):
                 try:
                     aspec = salt.utils.args.get_function_argspec(functions[fun])
                 except TypeError:
@@ -2451,12 +2746,18 @@ def is_bin_file(path):
     a bin, False if the file is not and None if the file is not available.
     '''
     if not os.path.isfile(path):
-        return None
+        return False
     try:
-        with fopen(path, 'r') as fp_:
-            return is_bin_str(fp_.read(2048))
+        with fopen(path, 'rb') as fp_:
+            try:
+                data = fp_.read(2048)
+                if six.PY3:
+                    data = data.decode(__salt_system_encoding__)
+                return is_bin_str(data)
+            except UnicodeDecodeError:
+                return True
     except os.error:
-        return None
+        return False
 
 
 def is_bin_str(data):
@@ -2475,7 +2776,7 @@ def is_bin_str(data):
         trans = ''.maketrans('', '', text_characters)
         nontext = data.translate(trans)
     else:
-        trans = string.maketrans('', '')
+        trans = string.maketrans('', '')  # pylint: disable=no-member
         nontext = data.translate(trans, text_characters)
 
     # If more than 30% non-text characters, then
@@ -2501,7 +2802,11 @@ def is_dictlist(data):
     return False
 
 
-def repack_dictlist(data):
+def repack_dictlist(data,
+                    strict=False,
+                    recurse=False,
+                    key_cb=None,
+                    val_cb=None):
     '''
     Takes a list of one-element dicts (as found in many SLS schemas) and
     repacks into a single dictionary.
@@ -2513,23 +2818,58 @@ def repack_dictlist(data):
         except yaml.parser.ParserError as err:
             log.error(err)
             return {}
-    if not isinstance(data, list) \
-            or [x for x in data
-                if not isinstance(x, (six.string_types, int, float, dict))]:
-        log.error('Invalid input: {0}'.format(pprint.pformat(data)))
-        log.error('Input must be a list of strings/dicts')
+
+    if key_cb is None:
+        key_cb = lambda x: x
+    if val_cb is None:
+        val_cb = lambda x, y: y
+
+    valid_non_dict = (six.string_types, int, float)
+    if isinstance(data, list):
+        for element in data:
+            if isinstance(element, valid_non_dict):
+                continue
+            elif isinstance(element, dict):
+                if len(element) != 1:
+                    log.error(
+                        'Invalid input for repack_dictlist: key/value pairs '
+                        'must contain only one element (data passed: %s).',
+                        element
+                    )
+                    return {}
+            else:
+                log.error(
+                    'Invalid input for repack_dictlist: element %s is '
+                    'not a string/dict/numeric value', element
+                )
+                return {}
+    else:
+        log.error(
+            'Invalid input for repack_dictlist, data passed is not a list '
+            '(%s)', data
+        )
         return {}
+
     ret = {}
     for element in data:
-        if isinstance(element, (six.string_types, int, float)):
-            ret[element] = None
+        if isinstance(element, valid_non_dict):
+            ret[key_cb(element)] = None
         else:
-            if len(element) != 1:
-                log.error('Invalid input: key/value pairs must contain '
-                          'only one element (data passed: {0}).'
-                          .format(element))
-                return {}
-            ret.update(element)
+            key = next(iter(element))
+            val = element[key]
+            if is_dictlist(val):
+                if recurse:
+                    ret[key_cb(key)] = repack_dictlist(val, recurse=recurse)
+                elif strict:
+                    log.error(
+                        'Invalid input for repack_dictlist: nested dictlist '
+                        'found, but recurse is set to False'
+                    )
+                    return {}
+                else:
+                    ret[key_cb(key)] = val_cb(key, val)
+            else:
+                ret[key_cb(key)] = val_cb(key, val)
     return ret
 
 
@@ -2721,7 +3061,7 @@ def chugid_and_umask(runas, umask):
     Helper method for for subprocess.Popen to initialise uid/gid and umask
     for the new process.
     '''
-    if runas is not None:
+    if runas is not None and runas != getpass.getuser():
         chugid(runas)
     if umask is not None:
         os.umask(umask)
@@ -2786,12 +3126,14 @@ def to_str(s, encoding=None):
         return s
     if six.PY3:
         if isinstance(s, (bytes, bytearray)):
-            return s.decode(encoding or __salt_system_encoding__)
+            # https://docs.python.org/3/howto/unicode.html#the-unicode-type
+            # replace error with U+FFFD, REPLACEMENT CHARACTER
+            return s.decode(encoding or __salt_system_encoding__, "replace")
         raise TypeError('expected str, bytes, or bytearray')
     else:
         if isinstance(s, bytearray):
             return str(s)
-        if isinstance(s, unicode):  # pylint: disable=incompatible-py3-code
+        if isinstance(s, unicode):  # pylint: disable=incompatible-py3-code,undefined-variable
             return s.encode(encoding or __salt_system_encoding__)
         raise TypeError('expected str, bytearray, or unicode')
 
@@ -2817,12 +3159,15 @@ def to_unicode(s, encoding=None):
     '''
     Given str or unicode, return unicode (str for python 3)
     '''
+    if not isinstance(s, (bytes, bytearray, six.string_types)):
+        return s
     if six.PY3:
-        return to_str(s, encoding)
+        if isinstance(s, (bytes, bytearray)):
+            return to_str(s, encoding)
     else:
         if isinstance(s, str):
             return s.decode(encoding or __salt_system_encoding__)
-        return unicode(s)  # pylint: disable=incompatible-py3-code
+    return s
 
 
 def is_list(value):
@@ -2830,6 +3175,29 @@ def is_list(value):
     Check if a variable is a list.
     '''
     return isinstance(value, list)
+
+
+def is_iter(y, ignore=six.string_types):
+    '''
+    Test if an object is iterable, but not a string type.
+
+    Test if an object is an iterator or is iterable itself. By default this
+    does not return True for string objects.
+
+    The `ignore` argument defaults to a list of string types that are not
+    considered iterable. This can be used to also exclude things like
+    dictionaries or named tuples.
+
+    Based on https://bitbucket.org/petershinners/yter
+    '''
+
+    if ignore and isinstance(y, ignore):
+        return False
+    try:
+        iter(y)
+        return True
+    except TypeError:
+        return False
 
 
 def invalid_kwargs(invalid_kwargs, raise_exc=True):
@@ -2851,3 +3219,179 @@ def invalid_kwargs(invalid_kwargs, raise_exc=True):
         raise SaltInvocationError(msg)
     else:
         return msg
+
+
+def shlex_split(s, **kwargs):
+    '''
+    Only split if variable is a string
+    '''
+    if isinstance(s, six.string_types):
+        return shlex.split(s, **kwargs)
+    else:
+        return s
+
+
+def split_input(val):
+    '''
+    Take an input value and split it into a list, returning the resulting list
+    '''
+    if isinstance(val, list):
+        return val
+    try:
+        return [x.strip() for x in val.split(',')]
+    except AttributeError:
+        return [x.strip() for x in str(val).split(',')]
+
+
+def str_version_to_evr(verstring):
+    '''
+    Split the package version string into epoch, version and release.
+    Return this as tuple.
+
+    The epoch is always not empty. The version and the release can be an empty
+    string if such a component could not be found in the version string.
+
+    "2:1.0-1.2" => ('2', '1.0', '1.2)
+    "1.0" => ('0', '1.0', '')
+    "" => ('0', '', '')
+    '''
+    if verstring in [None, '']:
+        return '0', '', ''
+
+    idx_e = verstring.find(':')
+    if idx_e != -1:
+        try:
+            epoch = str(int(verstring[:idx_e]))
+        except ValueError:
+            # look, garbage in the epoch field, how fun, kill it
+            epoch = '0'  # this is our fallback, deal
+    else:
+        epoch = '0'
+    idx_r = verstring.find('-')
+    if idx_r != -1:
+        version = verstring[idx_e + 1:idx_r]
+        release = verstring[idx_r + 1:]
+    else:
+        version = verstring[idx_e + 1:]
+        release = ''
+
+    return epoch, version, release
+
+
+def simple_types_filter(data):
+    '''
+    Convert the data list, dictionary into simple types, i.e., int, float, string,
+    bool, etc.
+    '''
+    if data is None:
+        return data
+
+    simpletypes_keys = (six.string_types, six.text_type, six.integer_types, float, bool)
+    simpletypes_values = tuple(list(simpletypes_keys) + [list, tuple])
+
+    if isinstance(data, (list, tuple)):
+        simplearray = []
+        for value in data:
+            if value is not None:
+                if isinstance(value, (dict, list)):
+                    value = simple_types_filter(value)
+                elif not isinstance(value, simpletypes_values):
+                    value = repr(value)
+            simplearray.append(value)
+        return simplearray
+
+    if isinstance(data, dict):
+        simpledict = {}
+        for key, value in six.iteritems(data):
+            if key is not None and not isinstance(key, simpletypes_keys):
+                key = repr(key)
+            if value is not None and isinstance(value, (dict, list, tuple)):
+                value = simple_types_filter(value)
+            elif value is not None and not isinstance(value, simpletypes_values):
+                value = repr(value)
+            simpledict[key] = value
+        return simpledict
+
+    return data
+
+
+def substr_in_list(string_to_search_for, list_to_search):
+    '''
+    Return a boolean value that indicates whether or not a given
+    string is present in any of the strings which comprise a list
+    '''
+    return any(string_to_search_for in s for s in list_to_search)
+
+
+def filter_by(lookup_dict,
+              lookup,
+              traverse,
+              merge=None,
+              default='default',
+              base=None):
+    '''
+    '''
+    ret = None
+    # Default value would be an empty list if lookup not found
+    val = traverse_dict_and_list(traverse, lookup, [])
+
+    # Iterate over the list of values to match against patterns in the
+    # lookup_dict keys
+    for each in val if isinstance(val, list) else [val]:
+        for key in lookup_dict:
+            test_key = key if isinstance(key, six.string_types) else str(key)
+            test_each = each if isinstance(each, six.string_types) else str(each)
+            if fnmatch.fnmatchcase(test_each, test_key):
+                ret = lookup_dict[key]
+                break
+        if ret is not None:
+            break
+
+    if ret is None:
+        ret = lookup_dict.get(default, None)
+
+    if base and base in lookup_dict:
+        base_values = lookup_dict[base]
+        if ret is None:
+            ret = base_values
+
+        elif isinstance(base_values, collections.Mapping):
+            if not isinstance(ret, collections.Mapping):
+                raise SaltException(
+                    'filter_by default and look-up values must both be '
+                    'dictionaries.')
+            ret = salt.utils.dictupdate.update(copy.deepcopy(base_values), ret)
+
+    if merge:
+        if not isinstance(merge, collections.Mapping):
+            raise SaltException(
+                'filter_by merge argument must be a dictionary.')
+
+        if ret is None:
+            ret = merge
+        else:
+            salt.utils.dictupdate.update(ret, copy.deepcopy(merge))
+
+    return ret
+
+
+def fnmatch_multiple(candidates, pattern):
+    '''
+    Convenience function which runs fnmatch.fnmatch() on each element of passed
+    iterable. The first matching candidate is returned, or None if there is no
+    matching candidate.
+    '''
+    # Make sure that candidates is iterable to avoid a TypeError when we try to
+    # iterate over its items.
+    try:
+        candidates_iter = iter(candidates)
+    except TypeError:
+        return None
+
+    for candidate in candidates_iter:
+        try:
+            if fnmatch.fnmatch(candidate, pattern):
+                return candidate
+        except TypeError:
+            pass
+    return None

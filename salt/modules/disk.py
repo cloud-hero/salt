@@ -9,18 +9,23 @@ import logging
 import os
 import subprocess
 import re
+import collections
+import decimal
+
+# Import 3rd-party libs
+from salt.ext import six
+from salt.ext.six.moves import zip
 
 # Import salt libs
 import salt.utils
 import salt.utils.decorators as decorators
 from salt.utils.decorators import depends
 from salt.exceptions import CommandExecutionError
-from salt.ext.six.moves import zip
 
 log = logging.getLogger(__name__)
 
-HAS_HDPARM = salt.utils.which_bin(['hdparm']) is not None
-HAS_SMARTCTL = salt.utils.which_bin(['smartctl']) is not None
+HAS_HDPARM = salt.utils.which('hdparm') is not None
+HAS_IOSTAT = salt.utils.which('iostat') is not None
 
 
 def __virtual__():
@@ -28,7 +33,7 @@ def __virtual__():
     Only work on POSIX-like systems
     '''
     if salt.utils.is_windows():
-        return False
+        return False, 'This module doesn\'t work on Windows.'
     return True
 
 
@@ -70,7 +75,7 @@ def usage(args=None):
         return {}
     if __grains__['kernel'] == 'Linux':
         cmd = 'df -P'
-    elif __grains__['kernel'] == 'OpenBSD':
+    elif __grains__['kernel'] == 'OpenBSD' or __grains__['kernel'] == 'AIX':
         cmd = 'df -kP'
     else:
         cmd = 'df'
@@ -92,9 +97,11 @@ def usage(args=None):
             continue
         else:
             oldline = None
-        while not comps[1].isdigit():
+        while len(comps) >= 2 and not comps[1].isdigit():
             comps[0] = '{0} {1}'.format(comps[0], comps[1])
             comps.pop(1)
+        if len(comps) < 2:
+            continue
         try:
             if __grains__['kernel'] == 'Darwin':
                 ret[comps[8]] = {
@@ -132,7 +139,10 @@ def inodeusage(args=None):
         salt '*' disk.inodeusage
     '''
     flags = _clean_flags(args, 'disk.inodeusage')
-    cmd = 'df -iP'
+    if __grains__['kernel'] == 'AIX':
+        cmd = 'df -i'
+    else:
+        cmd = 'df -iP'
     if flags:
         cmd += ' -{0}'.format(flags)
     ret = {}
@@ -152,6 +162,14 @@ def inodeusage(args=None):
                     'used': comps[5],
                     'free': comps[6],
                     'use': comps[7],
+                    'filesystem': comps[0],
+                }
+            elif __grains__['kernel'] == 'AIX':
+                ret[comps[6]] = {
+                    'inodes': comps[4],
+                    'used': comps[5],
+                    'free': comps[2],
+                    'use': comps[5],
                     'filesystem': comps[0],
                 }
             else:
@@ -180,7 +198,7 @@ def percent(args=None):
     '''
     if __grains__['kernel'] == 'Linux':
         cmd = 'df -P'
-    elif __grains__['kernel'] == 'OpenBSD':
+    elif __grains__['kernel'] == 'OpenBSD' or __grains__['kernel'] == 'AIX':
         cmd = 'df -kP'
     else:
         cmd = 'df'
@@ -192,9 +210,11 @@ def percent(args=None):
         if line.startswith('Filesystem'):
             continue
         comps = line.split()
-        while not comps[1].isdigit():
+        while len(comps) >= 2 and not comps[1].isdigit():
             comps[0] = '{0} {1}'.format(comps[0], comps[1])
             comps.pop(1)
+        if len(comps) < 2:
+            continue
         try:
             if __grains__['kernel'] == 'Darwin':
                 ret[comps[8]] = comps[4]
@@ -300,13 +320,16 @@ def wipe(device):
         salt '*' disk.wipe /dev/sda1
     '''
 
-    cmd = 'wipefs {0}'.format(device)
+    cmd = 'wipefs -a {0}'.format(device)
     try:
         out = __salt__['cmd.run_all'](cmd, python_shell=False)
     except subprocess.CalledProcessError as err:
         return False
     if out['retcode'] == 0:
         return True
+    else:
+        log.error('Error wiping device {0}: {1}'.format(device, out['stderr']))
+        return False
 
 
 def dump(device, args=None):
@@ -349,7 +372,6 @@ def resize2fs(device):
 
         salt '*' disk.resize2fs /dev/sda1
     '''
-    ret = {}
     cmd = 'resize2fs {0}'.format(device)
     try:
         out = __salt__['cmd.run_all'](cmd, python_shell=False)
@@ -359,6 +381,116 @@ def resize2fs(device):
         return True
 
 
+@decorators.which('sync')
+@decorators.which('mkfs')
+def format_(device,
+            fs_type='ext4',
+            inode_size=None,
+            lazy_itable_init=None,
+            force=False):
+    '''
+    Format a filesystem onto a device
+
+    .. versionadded:: 2016.11.0
+
+    device
+        The device in which to create the new filesystem
+
+    fs_type
+        The type of filesystem to create
+
+    inode_size
+        Size of the inodes
+
+        This option is only enabled for ext and xfs filesystems
+
+    lazy_itable_init
+        If enabled and the uninit_bg feature is enabled, the inode table will
+        not be fully initialized by mke2fs.  This speeds up filesystem
+        initialization noticeably, but it requires the kernel to finish
+        initializing the filesystem  in  the  background  when  the filesystem
+        is first mounted.  If the option value is omitted, it defaults to 1 to
+        enable lazy inode table zeroing.
+
+        This option is only enabled for ext filesystems
+
+    force
+        Force mke2fs to create a filesystem, even if the specified device is
+        not a partition on a block special device. This option is only enabled
+        for ext and xfs filesystems
+
+        This option is dangerous, use it with caution.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' disk.format /dev/sdX1
+    '''
+    cmd = ['mkfs', '-t', str(fs_type)]
+    if inode_size is not None:
+        if fs_type[:3] == 'ext':
+            cmd.extend(['-i', str(inode_size)])
+        elif fs_type == 'xfs':
+            cmd.extend(['-i', 'size={0}'.format(inode_size)])
+    if lazy_itable_init is not None:
+        if fs_type[:3] == 'ext':
+            cmd.extend(['-E', 'lazy_itable_init={0}'.format(lazy_itable_init)])
+    if force:
+        if fs_type[:3] == 'ext':
+            cmd.append('-F')
+        elif fs_type == 'xfs':
+            cmd.append('-f')
+    cmd.append(str(device))
+
+    mkfs_success = __salt__['cmd.retcode'](cmd, ignore_retcode=True) == 0
+    sync_success = __salt__['cmd.retcode']('sync', ignore_retcode=True) == 0
+
+    return all([mkfs_success, sync_success])
+
+
+@decorators.which_bin(['lsblk', 'df'])
+def fstype(device):
+    '''
+    Return the filesystem name of the specified device
+
+    .. versionadded:: 2016.11.0
+
+    device
+        The name of the device
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' disk.fstype /dev/sdX1
+    '''
+    if salt.utils.which('lsblk'):
+        lsblk_out = __salt__['cmd.run']('lsblk -o fstype {0}'.format(device)).splitlines()
+        if len(lsblk_out) > 1:
+            fs_type = lsblk_out[1].strip()
+            if fs_type:
+                return fs_type
+
+    if salt.utils.which('df'):
+        # the fstype was not set on the block device, so inspect the filesystem
+        # itself for its type
+        if __grains__['kernel'] == 'AIX' and os.path.isfile('/usr/sysv/bin/df'):
+            df_out = __salt__['cmd.run']('/usr/sysv/bin/df -n {0}'.format(device)).split()
+            if len(df_out) > 2:
+                fs_type = df_out[2]
+                if fs_type:
+                    return fs_type
+        else:
+            df_out = __salt__['cmd.run']('df -T {0}'.format(device)).splitlines()
+            if len(df_out) > 1:
+                fs_type = df_out[1]
+                if fs_type:
+                    return fs_type
+
+    return ''
+
+
 @depends(HAS_HDPARM)
 def _hdparm(args, failhard=True):
     '''
@@ -366,15 +498,14 @@ def _hdparm(args, failhard=True):
     Fail hard when required
     return output when possible
     '''
-    cmd = 'hdparm {1}'.format(args)
-    log.trace('Running {0}'.format(cmd))
+    cmd = 'hdparm {0}'.format(args)
     result = __salt__['cmd.run_all'](cmd)
     if result['retcode'] != 0:
         msg = '{0}: {1}'.format(cmd, result['stderr'])
         if failhard:
             raise CommandExecutionError(msg)
         else:
-            log.warn(msg)
+            log.warning(msg)
 
     return result['stdout']
 
@@ -386,7 +517,7 @@ def hdparms(disks, args=None):
     parse 'em into a nice dict
     (which, considering hdparms output, is quite a hassle)
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
     .. code-block:: bash
@@ -396,10 +527,10 @@ def hdparms(disks, args=None):
     all_parms = 'aAbBcCdgHiJkMmNnQrRuW'
     if args is None:
         args = all_parms
-    elif isinstance(args, [list, tuple]):
+    elif isinstance(args, (list, tuple)):
         args = ''.join(args)
 
-    if not isinstance(disks, [list, tuple]):
+    if not isinstance(disks, (list, tuple)):
         disks = [disks]
 
     out = {}
@@ -467,11 +598,13 @@ def hpa(disks, size=None):
 
     It's often used by OEMS to hide parts of a disk, and for overprovisioning SSD's
 
-    *WARNING* Setting the HPA might clobber your data, be very careful with this on active disks!
+    .. warning::
+        Setting the HPA might clobber your data, be very careful with this on active disks!
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
+
     .. code-block:: bash
 
         salt '*' disk.hpa /dev/sda
@@ -520,9 +653,10 @@ def smart_attributes(dev, attributes=None, values=None):
     set (https://www.backblaze.com/blog/hard-drive-smart-stats/):
     (5,187,188,197,198)
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
+
     .. code-block:: bash
 
         salt '*' disk.smart_attributes /dev/sda
@@ -566,7 +700,7 @@ def smart_attributes(dev, attributes=None, values=None):
         except:  # pylint: disable=bare-except
             pass
 
-        for field in data.keys():
+        for field in data:
             val = data[field]
             try:
                 val = int(val)
@@ -580,3 +714,132 @@ def smart_attributes(dev, attributes=None, values=None):
         smart_attr[attr] = data
 
     return smart_attr
+
+
+@depends(HAS_IOSTAT)
+def iostat(interval=1, count=5, disks=None):
+    '''
+    Gather and return (averaged) IO stats.
+
+    .. versionadded:: 2016.3.0
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' disk.iostat 1 5 disks=sda
+    '''
+    if salt.utils.is_linux():
+        return _iostat_linux(interval, count, disks)
+    elif salt.utils.is_freebsd():
+        return _iostat_fbsd(interval, count, disks)
+
+
+def _iostats_dict(header, stats):
+    '''
+    Transpose collected data, average it, stomp it in dict using header
+
+    Use Decimals so we can properly calc & round, convert to float 'caus' we can't transmit Decimals over 0mq
+    '''
+    stats = [float((sum(stat) / len(stat)).quantize(decimal.Decimal('.01'))) for stat in zip(*stats)]
+    stats = dict(zip(header, stats))
+    return stats
+
+
+def _iostat_fbsd(interval, count, disks):
+    '''
+    Tested on FreeBSD, quite likely other BSD's only need small changes in cmd syntax
+    '''
+    if disks is None:
+        iostat_cmd = 'iostat -xC -w {0} -c {1} '.format(interval, count)
+    elif isinstance(disks, six.string_types):
+        iostat_cmd = 'iostat -x -w {0} -c {1} {2}'.format(interval, count, disks)
+    else:
+        iostat_cmd = 'iostat -x -w {0} -c {1} {2}'.format(interval, count, ' '.join(disks))
+
+    sys_stats = []
+    dev_stats = collections.defaultdict(list)
+    sys_header = []
+    dev_header = []
+    h_len = 1000  # randomly absurdly high
+
+    ret = iter(__salt__['cmd.run_stdout'](iostat_cmd, output_loglevel='quiet').splitlines())
+    for line in ret:
+        if not line.startswith('device'):
+            continue
+        elif not len(dev_header):
+            dev_header = line.split()[1:]
+        while line is not False:
+            line = next(ret, False)
+            if not line or not line[0].isalnum():
+                break
+            line = line.split()
+            disk = line[0]
+            stats = [decimal.Decimal(x) for x in line[1:]]
+            # h_len will become smallest number of fields in stat lines
+            if len(stats) < h_len:
+                h_len = len(stats)
+            dev_stats[disk].append(stats)
+
+    iostats = {}
+
+    # The header was longer than the smallest number of fields
+    # Therefore the sys stats are hidden in there
+    if h_len < len(dev_header):
+        sys_header = dev_header[h_len:]
+        dev_header = dev_header[0:h_len]
+
+        for disk, stats in dev_stats.items():
+            if len(stats[0]) > h_len:
+                sys_stats = [stat[h_len:] for stat in stats]
+                dev_stats[disk] = [stat[0:h_len] for stat in stats]
+
+        iostats['sys'] = _iostats_dict(sys_header, sys_stats)
+
+    for disk, stats in dev_stats.items():
+        iostats[disk] = _iostats_dict(dev_header, stats)
+
+    return iostats
+
+
+def _iostat_linux(interval, count, disks):
+    if disks is None:
+        iostat_cmd = 'iostat -x {0} {1} '.format(interval, count)
+    elif isinstance(disks, six.string_types):
+        iostat_cmd = 'iostat -xd {0} {1} {2}'.format(interval, count, disks)
+    else:
+        iostat_cmd = 'iostat -xd {0} {1} {2}'.format(interval, count, ' '.join(disks))
+
+    sys_stats = []
+    dev_stats = collections.defaultdict(list)
+    sys_header = []
+    dev_header = []
+
+    ret = iter(__salt__['cmd.run_stdout'](iostat_cmd, output_loglevel='quiet').splitlines())
+    for line in ret:
+        if line.startswith('avg-cpu:'):
+            if not len(sys_header):
+                sys_header = tuple(line.split()[1:])
+            line = [decimal.Decimal(x) for x in next(ret).split()]
+            sys_stats.append(line)
+        elif line.startswith('Device:'):
+            if not len(dev_header):
+                dev_header = tuple(line.split()[1:])
+            while line is not False:
+                line = next(ret, False)
+                if not line or not line[0].isalnum():
+                    break
+                line = line.split()
+                disk = line[0]
+                stats = [decimal.Decimal(x) for x in line[1:]]
+                dev_stats[disk].append(stats)
+
+    iostats = {}
+
+    if len(sys_header):
+        iostats['sys'] = _iostats_dict(sys_header, sys_stats)
+
+    for disk, stats in dev_stats.items():
+        iostats[disk] = _iostats_dict(dev_header, stats)
+
+    return iostats

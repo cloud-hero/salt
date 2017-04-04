@@ -2,11 +2,14 @@
 '''
 Beacon to monitor network adapter setting changes on Linux
 
+.. versionadded:: 2016.3.0
+
 '''
 from __future__ import absolute_import
 # Import third party libs
 try:
-    from pyroute2.ipdb import IPDB
+    from pyroute2 import IPDB
+    IP = IPDB()
     HAS_PYROUTE2 = True
 except ImportError:
     HAS_PYROUTE2 = False
@@ -27,8 +30,6 @@ ATTRS = ['family', 'txqlen', 'ipdb_scope', 'index', 'operstate', 'group',
 
 LAST_STATS = {}
 
-IP = IPDB()
-
 
 class Hashabledict(dict):
     '''
@@ -44,27 +45,25 @@ def __virtual__():
     return False
 
 
-def validate(config):
+def __validate__(config):
     '''
     Validate the beacon configuration
     '''
     if not isinstance(config, dict):
-        log.info('Configuration for network_settings beacon must be a dictionary.')
-        return False
+        return False, ('Configuration for network_settings '
+                       'beacon must be a dictionary.')
     else:
         for item in config:
             if item == 'coalesce':
                 continue
             if not isinstance(config[item], dict):
-                log.info('Configuration for network_settings beacon must be a '
-                         'dictionary of dictionaries.')
-                return False
+                return False, ('Configuration for network_settings beacon must be a '
+                               'dictionary of dictionaries.')
             else:
                 if not all(j in ATTRS for j in config[item]):
-                    log.info('Invalid configuration item in Beacon '
-                             'configuration.')
-                    return False
-    return True
+                    return False, ('Invalid configuration item in Beacon '
+                                   'configuration.')
+    return True, 'Valid beacon configuration'
 
 
 def _copy_interfaces_info(interfaces):
@@ -98,12 +97,13 @@ def beacon(config):
     .. code-block:: yaml
 
         beacons:
-          eth0:
-            ipaddr:
-            promiscuity:
-              onvalue: 1
-          eth1:
-            linkmode:
+          network_settings:
+            eth0:
+              ipaddr:
+              promiscuity:
+                onvalue: 1
+            eth1:
+              linkmode:
 
     The config above will check for value changes on eth0 ipaddr and eth1 linkmode. It will also
     emit if the promiscuity value changes to 1.
@@ -117,10 +117,11 @@ def beacon(config):
     .. code-block:: yaml
 
         beacons:
-          coalesce: True
-          eth0:
-            ipaddr:
-            promiscuity:
+          network_settings:
+            coalesce: True
+            eth0:
+              ipaddr:
+              promiscuity:
 
     '''
     ret = []

@@ -9,7 +9,7 @@ import urlparse
 # pylint: disable=import-error,no-name-in-module
 from salt.ext.six.moves.urllib.parse import urlparse
 # pylint: enable=import-error,no-name-in-module
-from mako.lookup import TemplateCollection, TemplateLookup  # pylint: disable=import-error
+from mako.lookup import TemplateCollection, TemplateLookup  # pylint: disable=import-error,3rd-party-module-not-gated
 
 # Import salt libs
 import salt.fileclient
@@ -44,21 +44,22 @@ class SaltMakoTemplateLookup(TemplateCollection):
 
     """
 
-    def __init__(self, opts, saltenv='base', env=None):
-        if env is not None:
-            salt.utils.warn_until(
-                'Boron',
-                'Passing a salt environment should be done using \'saltenv\' '
-                'not \'env\'. This functionality will be removed in Salt '
-                'Boron.'
-            )
-            # Backwards compatibility
-            saltenv = env
+    def __init__(self, opts, saltenv='base', pillar_rend=False):
         self.opts = opts
         self.saltenv = saltenv
-        self.file_client = salt.fileclient.get_file_client(self.opts)
+        self._file_client = None
+        self.pillar_rend = pillar_rend
         self.lookup = TemplateLookup(directories='/')
         self.cache = {}
+
+    def file_client(self):
+        '''
+        Setup and return file_client
+        '''
+        if not self._file_client:
+            self._file_client = salt.fileclient.get_file_client(
+                self.opts, self.pillar_rend)
+        return self._file_client
 
     def adjust_uri(self, uri, filename):
         scheme = urlparse(uri).scheme
@@ -93,7 +94,7 @@ class SaltMakoTemplateLookup(TemplateCollection):
 
     def cache_file(self, fpath):
         if fpath not in self.cache:
-            self.cache[fpath] = self.file_client.get_file(fpath,
+            self.cache[fpath] = self.file_client().get_file(fpath,
                                                           '',
                                                           True,
                                                           self.saltenv)

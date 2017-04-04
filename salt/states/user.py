@@ -31,10 +31,10 @@ import logging
 
 # Import salt libs
 import salt.utils
-import salt.utils.locales
+from salt.utils.locales import sdecode, sdecode_if_string
 
 # Import 3rd-party libs
-import salt.ext.six as six
+from salt.ext.six import string_types, iteritems
 
 log = logging.getLogger(__name__)
 
@@ -72,7 +72,7 @@ def _changes(name,
              maxdays=999999,
              inactdays=0,
              warndays=7,
-             expire=-1,
+             expire=None,
              win_homedrive=None,
              win_profile=None,
              win_logonscript=None,
@@ -96,6 +96,8 @@ def _changes(name,
         return False
 
     change = {}
+    if groups is None:
+        groups = lusr['groups']
     wanted_groups = sorted(set((groups or []) + (optional_groups or [])))
     if uid and lusr['uid'] != uid:
         change['uid'] = uid
@@ -140,9 +142,15 @@ def _changes(name,
             change['inactdays'] = inactdays
         if warndays and warndays is not 7 and lshad['warn'] != warndays:
             change['warndays'] = warndays
-        if expire and expire is not -1 and lshad['expire'] != expire:
+        if expire and lshad['expire'] != expire:
             change['expire'] = expire
+    elif 'shadow.info' in __salt__ and salt.utils.is_windows():
+        if expire and expire is not -1 and salt.utils.date_format(lshad['expire']) != salt.utils.date_format(expire):
+            change['expire'] = expire
+
     # GECOS fields
+    fullname = sdecode_if_string(fullname)
+    lusr['fullname'] = sdecode_if_string(lusr['fullname'])
     if fullname is not None and lusr['fullname'] != fullname:
         change['fullname'] = fullname
     if win_homedrive and lusr['homedrive'] != win_homedrive:
@@ -157,17 +165,23 @@ def _changes(name,
     # MacOS doesn't have full GECOS support, so check for the "ch" functions
     # and ignore these parameters if these functions do not exist.
     if 'user.chroomnumber' in __salt__ \
-            and roomnumber is not None \
-            and lusr['roomnumber'] != roomnumber:
-        change['roomnumber'] = roomnumber
+            and roomnumber is not None:
+        roomnumber = sdecode_if_string(roomnumber)
+        lusr['roomnumber'] = sdecode_if_string(lusr['roomnumber'])
+        if lusr['roomnumber'] != roomnumber:
+            change['roomnumber'] = roomnumber
     if 'user.chworkphone' in __salt__ \
-            and workphone is not None \
-            and lusr['workphone'] != workphone:
-        change['workphone'] = workphone
+            and workphone is not None:
+        workphone = sdecode_if_string(workphone)
+        lusr['workphone'] = sdecode_if_string(lusr['workphone'])
+        if lusr['workphone'] != workphone:
+            change['workphone'] = workphone
     if 'user.chhomephone' in __salt__ \
-            and homephone is not None \
-            and lusr['homephone'] != homephone:
-        change['homephone'] = homephone
+            and homephone is not None:
+        homephone = sdecode_if_string(homephone)
+        lusr['homephone'] = sdecode_if_string(lusr['homephone'])
+        if lusr['homephone'] != homephone:
+            change['homephone'] = homephone
     # OpenBSD/FreeBSD login class
     if __grains__['kernel'] in ('OpenBSD', 'FreeBSD'):
         if loginclass:
@@ -187,6 +201,7 @@ def present(name,
             home=None,
             createhome=True,
             password=None,
+            hash_password=False,
             enforce_password=True,
             empty_password=False,
             shell=None,
@@ -206,7 +221,8 @@ def present(name,
             win_homedrive=None,
             win_profile=None,
             win_logonscript=None,
-            win_description=None):
+            win_description=None,
+            nologinit=False):
     '''
     Ensure that the named user is present with the specified properties
 
@@ -228,7 +244,8 @@ def present(name,
         A list of groups to assign the user to, pass a list object. If a group
         specified here does not exist on the minion, the state will fail.
         If set to the empty list, the user will be removed from all groups
-        except the default group.
+        except the default group. If unset, salt will assume current groups
+        are still wanted (see issue #28706).
 
     optional_groups
         A list of groups to assign the user to, pass a list object. If a group
@@ -244,23 +261,40 @@ def present(name,
 
     home
         The custom login directory of user. Uses default value of underlying
-        system if not set. Notice that this directory does not have to exists.
+        system if not set. Notice that this directory does not have to exist.
         This also the location of the home directory to create if createhome is
         set to True.
 
-    createhome
-        If False, the home directory will not be created if it doesn't exist.
-        Please note that directories leading up to the home directory
-        will NOT be created, Default is ``True``.
+    createhome : True
+        If set to ``False``, the home directory will not be created if it
+        doesn't already exist.
+
+        .. warning::
+            Not supported on Windows or Mac OS.
+
+            Additionally, parent directories will *not* be created. The parent
+            directory for ``home`` must already exist.
+
+    nologinit : False
+        If set to ``True``, it will not add the user to lastlog and faillog
+        databases.
+
+        .. note::
+            Not supported on Windows or Mac OS.
 
     password
         A password hash to set for the user. This field is only supported on
         Linux, FreeBSD, NetBSD, OpenBSD, and Solaris. If the ``empty_password``
         argument is set to ``True`` then ``password`` is ignored.
         For Windows this is the plain text password.
+        For Linux, the hash can be generated with ``openssl passwd -1``.
 
     .. versionchanged:: 0.16.0
        BSD support added.
+
+    hash_password
+        Set to True to hash the clear text password. Default is ``False``.
+
 
     enforce_password
         Set to False to keep the password from being changed if it has already
@@ -303,6 +337,7 @@ def present(name,
 
     homephone
         The user's home phone number (not supported in MacOS)
+        If GECOS field contains more than 3 commas, this field will have the rest of 'em
 
     .. versionchanged:: 2014.7.0
        Shadow attribute support added.
@@ -340,34 +375,54 @@ def present(name,
         mapped to the specified drive. Must be a letter followed by a colon.
         Because of the colon, the value must be surrounded by single quotes. ie:
         - win_homedrive: 'U:
-    .. versionchanged:: 2015.8.0
+
+        .. versionchanged:: 2015.8.0
 
     win_profile (Windows Only)
         The custom profile directory of the user. Uses default value of
         underlying system if not set.
-    .. versionchanged:: 2015.8.0
+
+        .. versionchanged:: 2015.8.0
 
     win_logonscript (Windows Only)
         The full path to the logon script to run when the user logs in.
-    .. versionchanged:: 2015.8.0
+
+        .. versionchanged:: 2015.8.0
 
     win_description (Windows Only)
         A brief description of the purpose of the users account.
-    .. versionchanged:: 2015.8.0
+
+        .. versionchanged:: 2015.8.0
     '''
+
+    # First check if a password is set. If password is set, check if
+    # hash_password is True, then hash it.
+
+    if password and hash_password:
+        log.debug('Hashing a clear text password')
+        password = __salt__['shadow.gen_password'](password)
+
     if fullname is not None:
-        fullname = salt.utils.locales.sdecode(fullname)
+        fullname = sdecode(fullname)
     if roomnumber is not None:
-        roomnumber = salt.utils.locales.sdecode(roomnumber)
+        roomnumber = sdecode(roomnumber)
     if workphone is not None:
-        workphone = salt.utils.locales.sdecode(workphone)
+        workphone = sdecode(workphone)
     if homephone is not None:
-        homephone = salt.utils.locales.sdecode(homephone)
+        homephone = sdecode(homephone)
 
     ret = {'name': name,
            'changes': {},
            'result': True,
            'comment': 'User {0} is present and up to date'.format(name)}
+
+    # the comma is used to separate field in GECOS, thus resulting into
+    # salt adding the end of fullname each time this function is called
+    for gecos_field in ['fullname', 'roomnumber', 'workphone']:
+        if isinstance(gecos_field, string_types) and ',' in gecos_field:
+            ret['comment'] = "Unsupported char ',' in {0}".format(gecos_field)
+            ret['result'] = False
+            return ret
 
     if groups:
         missing_groups = [x for x in groups if not __salt__['group.info'](x)]
@@ -433,10 +488,12 @@ def present(name,
             ret['result'] = None
             ret['comment'] = ('The following user attributes are set to be '
                               'changed:\n')
-            for key, val in six.iteritems(changes):
-                if key == 'password':
+            for key, val in iteritems(changes):
+                if key == 'passwd':
                     val = 'XXX-REDACTED-XXX'
-                ret['comment'] += '{0}: {1}\n'.format(key, val)
+                elif key == 'group' and not remove_groups:
+                    key = 'ensure groups'
+                ret['comment'] += u'{0}: {1}\n'.format(key, val)
             return ret
         # The user is present
         if 'shadow.info' in __salt__:
@@ -444,19 +501,28 @@ def present(name,
         if __grains__['kernel'] in ('OpenBSD', 'FreeBSD'):
             lcpre = __salt__['user.get_loginclass'](name)
         pre = __salt__['user.info'](name)
-        for key, val in six.iteritems(changes):
+        for key, val in iteritems(changes):
             if key == 'passwd' and not empty_password:
                 __salt__['shadow.set_password'](name, password)
+                continue
+            if key == 'passwd' and empty_password:
+                log.warn("No password will be set when empty_password=True")
                 continue
             if key == 'date':
                 __salt__['shadow.set_date'](name, date)
                 continue
             # run chhome once to avoid any possible bad side-effect
             if key == 'home' and 'homeDoesNotExist' not in changes:
-                __salt__['user.chhome'](name, val, False)
+                if __grains__['kernel'] in ('Darwin', 'Windows'):
+                    __salt__['user.chhome'](name, val)
+                else:
+                    __salt__['user.chhome'](name, val, persist=False)
                 continue
             if key == 'homeDoesNotExist':
-                __salt__['user.chhome'](name, val, True)
+                if __grains__['kernel'] in ('Darwin', 'Windows'):
+                    __salt__['user.chhome'](name, val)
+                else:
+                    __salt__['user.chhome'](name, val, persist=True)
                 if not os.path.isdir(val):
                     __salt__['file.mkdir'](val, pre['uid'], pre['gid'], 0o755)
                 continue
@@ -507,7 +573,10 @@ def present(name,
         if 'shadow.info' in __salt__:
             for key in spost:
                 if lshad[key] != spost[key]:
-                    ret['changes'][key] = spost[key]
+                    if key == 'passwd':
+                        ret['changes'][key] = 'XXX-REDACTED-XXX'
+                    else:
+                        ret['changes'][key] = spost[key]
         if __grains__['kernel'] in ('OpenBSD', 'FreeBSD') and lcpost != lcpre:
             ret['changes']['loginclass'] = lcpost
         if ret['changes']:
@@ -574,6 +643,7 @@ def present(name,
                       'workphone': workphone,
                       'homephone': homephone,
                       'createhome': createhome,
+                      'nologinit': nologinit,
                       'loginclass': loginclass}
         else:
             params = ({'name': name,
@@ -589,7 +659,12 @@ def present(name,
         if __salt__['user.add'](**params):
             ret['comment'] = 'New user {0} created'.format(name)
             ret['changes'] = __salt__['user.info'](name)
-            if 'shadow.info' in __salt__ and not salt.utils.is_windows():
+            if not createhome:
+                # pwd incorrectly reports presence of home
+                ret['changes']['home'] = ''
+            if 'shadow.info' in __salt__ \
+                and not salt.utils.is_windows()\
+                and not salt.utils.is_darwin():
                 if password and not empty_password:
                     __salt__['shadow.set_password'](name, password)
                     spost = __salt__['shadow.info'](name)
@@ -653,8 +728,25 @@ def present(name,
                                          ' {1}'.format(name, expire)
                         ret['result'] = False
                     ret['changes']['expire'] = expire
-            elif salt.utils.is_windows() and password and not empty_password:
-                if not __salt__['user.setpassword'](name, password):
+            elif salt.utils.is_windows():
+                if password and not empty_password:
+                    if not __salt__['user.setpassword'](name, password):
+                        ret['comment'] = 'User {0} created but failed to set' \
+                                         ' password to' \
+                                         ' {1}'.format(name, 'XXX-REDACTED-XXX')
+                        ret['result'] = False
+                    ret['changes']['passwd'] = 'XXX-REDACTED-XXX'
+                if expire:
+                    __salt__['shadow.set_expire'](name, expire)
+                    spost = __salt__['shadow.info'](name)
+                    if salt.utils.date_format(spost['expire']) != salt.utils.date_format(expire):
+                        ret['comment'] = 'User {0} created but failed to set' \
+                                         ' expire days to' \
+                                         ' {1}'.format(name, expire)
+                        ret['result'] = False
+                    ret['changes']['expiration_date'] = spost['expire']
+            elif salt.utils.is_darwin() and password and not empty_password:
+                if not __salt__['shadow.set_password'](name, password):
                     ret['comment'] = 'User {0} created but failed to set' \
                                      ' password to' \
                                      ' {1}'.format(name, 'XXX-REDACTED-XXX')

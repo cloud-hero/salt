@@ -25,6 +25,7 @@ Example output::
 '''
 from __future__ import absolute_import
 # Import python libs
+import salt.utils.odict
 from numbers import Number
 
 # Import salt libs
@@ -90,17 +91,20 @@ class NestDisplay(object):
                 )
             )
         elif isinstance(ret, string_types):
+            first_line = True
             for line in ret.splitlines():
                 if self.strip_colors:
                     line = salt.output.strip_esc_sequence(line)
+                line_prefix = ' ' * len(prefix) if not first_line else prefix
                 out.append(
                     self.ustring(
                         indent,
                         self.GREEN,
                         line,
-                        prefix=prefix
+                        prefix=line_prefix
                     )
                 )
+                first_line = False
         elif isinstance(ret, (list, tuple)):
             for ind in ret:
                 if isinstance(ind, (list, tuple, dict)):
@@ -124,7 +128,14 @@ class NestDisplay(object):
                         '----------'
                     )
                 )
-            for key in sorted(ret):
+
+            # respect key ordering of ordered dicts
+            if isinstance(ret, salt.utils.odict.OrderedDict):
+                keys = ret.keys()
+            else:
+                keys = sorted(ret)
+
+            for key in keys:
                 val = ret[key]
                 out.append(
                     self.ustring(
@@ -139,11 +150,12 @@ class NestDisplay(object):
         return out
 
 
-def output(ret):
+def output(ret, **kwargs):
     '''
     Display ret data
     '''
+    # Prefer kwargs before opts
+    base_indent = kwargs.get('nested_indent', 0) \
+        or __opts__.get('nested_indent', 0)
     nest = NestDisplay()
-    return '\n'.join(
-        nest.display(ret, __opts__.get('nested_indent', 0), '', [])
-    )
+    return '\n'.join(nest.display(ret, base_indent, '', []))

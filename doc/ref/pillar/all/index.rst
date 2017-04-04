@@ -1,8 +1,8 @@
 .. _all-salt.pillars:
 
-===================================
-Full list of builtin pillar modules
-===================================
+==============
+pillar modules
+==============
 
 .. currentmodule:: salt.pillar
 
@@ -14,7 +14,9 @@ Full list of builtin pillar modules
     cmd_yaml
     cmd_yamlex
     cobbler
+    confidant
     consul_pillar
+    csvpillar
     django_orm
     ec2_pillar
     etcd_pillar
@@ -23,19 +25,28 @@ Full list of builtin pillar modules
     git_pillar
     hg_pillar
     hiera
+    http_json
+    http_yaml
     libvirt
+    makostack
     mongo
     mysql
     neutron
+    nodegroups
     pepa
     pillar_ldap
+    postgres
     puppet
     reclass_adapter
     redismod
     s3
     sql_base
+    sqlcipher
     sqlite3
     stack
     svn_pillar
     varstack_pillar
+    vault
     virtkey
+    vmware_pillar
+

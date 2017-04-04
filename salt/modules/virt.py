@@ -24,12 +24,12 @@ from xml.etree import ElementTree
 import yaml
 import jinja2
 import jinja2.exceptions
-from xml.dom import minidom
 import salt.ext.six as six
 from salt.ext.six.moves import StringIO as _StringIO  # pylint: disable=import-error
 from xml.dom import minidom
 try:
     import libvirt  # pylint: disable=import-error
+    from libvirt import libvirtError
     HAS_LIBVIRT = True
 except ImportError:
     HAS_LIBVIRT = False
@@ -63,7 +63,7 @@ VIRT_DEFAULT_HYPER = 'kvm'
 
 def __virtual__():
     if not HAS_LIBVIRT:
-        return False
+        return (False, 'Unable to locate or import python libvirt library.')
     return 'virt'
 
 
@@ -142,7 +142,7 @@ def __get_conn():
                                     __esxi_auth(),
                                     0]],
         'qemu': [libvirt.open, [conn_str]],
-        }
+    }
 
     hypervisor = __salt__['config.get']('libvirt:hypervisor', 'qemu')
 
@@ -234,10 +234,10 @@ def _gen_xml(name,
              hypervisor,
              **kwargs):
     '''
-    Generate the XML string to define a libvirt vm
+    Generate the XML string to define a libvirt VM
     '''
     hypervisor = 'vmware' if hypervisor == 'esxi' else hypervisor
-    mem = mem * 1024  # MB
+    mem = int(mem) * 1024  # MB
     context = {
         'hypervisor': hypervisor,
         'name': name,
@@ -249,6 +249,11 @@ def _gen_xml(name,
     elif hypervisor in ['esxi', 'vmware']:
         # TODO: make bus and model parameterized, this works for 64-bit Linux
         context['controller_model'] = 'lsilogic'
+
+    if kwargs.get('enable_vnc', True):
+        context['enable_vnc'] = True
+    else:
+        context['enable_vnc'] = False
 
     if 'boot_dev' in kwargs:
         context['boot_dev'] = []
@@ -521,9 +526,9 @@ def _nic_profile(profile_name, hypervisor, **kwargs):
                 attributes[key] = value
 
     def _assign_mac(attributes):
-        dmac = '{0}_mac'.format(attributes['name'])
-        if dmac in kwargs:
-            dmac = kwargs[dmac]
+        dmac = kwargs.get('dmac', None)
+        if dmac is not None:
+            log.debug('DMAC address is {0}'.format(dmac))
             if salt.utils.validate.net.mac(dmac):
                 attributes['mac'] = dmac
             else:
@@ -550,6 +555,13 @@ def init(name,
          start=True,  # pylint: disable=redefined-outer-name
          disk='default',
          saltenv='base',
+         seed=True,
+         install=True,
+         pub_key=None,
+         priv_key=None,
+         seed_cmd='seed.apply',
+         enable_vnc=False,
+         enable_qcow=False,
          **kwargs):
     '''
     Initialize a new vm
@@ -559,20 +571,25 @@ def init(name,
     .. code-block:: bash
 
         salt 'hypervisor' virt.init vm_name 4 512 salt://path/to/image.raw
+        salt 'hypervisor' virt.init vm_name 4 512 /var/lib/libvirt/images/img.raw
         salt 'hypervisor' virt.init vm_name 4 512 nic=profile disk=profile
     '''
     hypervisor = __salt__['config.get']('libvirt:hypervisor', hypervisor)
+    log.debug('Using hyperisor {0}'.format(hypervisor))
 
     nicp = _nic_profile(nic, hypervisor, **kwargs)
+    log.debug('NIC profile is {0}'.format(nicp))
 
     diskp = None
     seedable = False
     if image:  # with disk template image
+        log.debug('Image {0} will be used'.format(image))
         # if image was used, assume only one disk, i.e. the
         # 'default' disk profile
         # TODO: make it possible to use disk profiles and use the
         # template image as the system disk
         diskp = _disk_profile('default', hypervisor, **kwargs)
+        log.debug('Disk profile is {0}'.format(diskp))
 
         # When using a disk profile extract the sole dict key of the first
         # array element as the filename for disk
@@ -582,67 +599,105 @@ def init(name,
 
         if hypervisor in ['esxi', 'vmware']:
             # TODO: we should be copying the image file onto the ESX host
-            raise SaltInvocationError('virt.init does not support image '
-                                      'template template in conjunction '
-                                      'with esxi hypervisor')
+            raise SaltInvocationError(
+                'virt.init does not support image template template in '
+                'conjunction with esxi hypervisor'
+            )
         elif hypervisor in ['qemu', 'kvm']:
             img_dir = __salt__['config.option']('virt.images')
+            log.debug('Image directory from config option `virt.images` is {0}'
+                      .format(img_dir))
             img_dest = os.path.join(
                 img_dir,
                 name,
                 disk_file_name
             )
+            log.debug('Image destination will be {0}'.format(img_dest))
             img_dir = os.path.dirname(img_dest)
+            log.debug('Image destination directory is  {0}'.format(img_dir))
             sfn = __salt__['cp.cache_file'](image, saltenv)
-            if not os.path.isdir(img_dir):
-                os.makedirs(img_dir)
+
             try:
-                salt.utils.files.copyfile(sfn, img_dest)
+                os.makedirs(img_dir)
+            except OSError:
+                pass
+
+            qcow2 = False
+            if salt.utils.which('qemu-img'):
+                res = __salt__['cmd.run']('qemu-img info {}'.format(sfn))
+                imageinfo = yaml.load(res)
+                qcow2 = imageinfo['file format'] == 'qcow2'
+
+            try:
+                if enable_qcow and qcow2:
+                    log.info('Cloning qcow2 image {} using copy on write'
+                              .format(sfn))
+                    __salt__['cmd.run'](
+                        'qemu-img create -f qcow2 -o backing_file={} {}'
+                        .format(sfn, img_dest).split())
+                else:
+                    log.debug('Copying {0} to {1}'.format(sfn, img_dest))
+                    salt.utils.files.copyfile(sfn, img_dest)
                 mask = os.umask(0)
                 os.umask(mask)
                 # Apply umask and remove exec bit
                 mode = (0o0777 ^ mask) & 0o0666
                 os.chmod(img_dest, mode)
-
             except (IOError, OSError) as e:
                 raise CommandExecutionError('problem copying image. {0} - {1}'.format(image, e))
 
             seedable = True
         else:
-            log.error('unsupported hypervisor when handling disk image')
-
+            log.error('Unsupported hypervisor when handling disk image')
     else:
         # no disk template image specified, create disks based on disk profile
         diskp = _disk_profile(disk, hypervisor, **kwargs)
+        log.debug('No image specified, disk profile will be used: {0}'.format(diskp))
         if hypervisor in ['qemu', 'kvm']:
             # TODO: we should be creating disks in the local filesystem with
             # qemu-img
-            raise SaltInvocationError('virt.init does not support disk '
-                                      'profiles in conjunction with '
-                                      'qemu/kvm at this time, use image '
-                                      'template instead')
+            raise SaltInvocationError(
+                'virt.init does not support disk profiles in conjunction with '
+                'qemu/kvm at this time, use image template instead'
+            )
         else:
             # assume libvirt manages disks for us
             for disk in diskp:
                 for disk_name, args in six.iteritems(disk):
-                    xml = _gen_vol_xml(name,
-                                       disk_name,
-                                       args['size'],
-                                       hypervisor)
+                    log.debug('Generating libvirt XML for {0}'.format(disk))
+                    xml = _gen_vol_xml(
+                        name,
+                        disk_name,
+                        args['size'],
+                        hypervisor,
+                    )
                     define_vol_xml_str(xml)
 
+    log.debug('Generating VM XML')
+    kwargs['enable_vnc'] = enable_vnc
     xml = _gen_xml(name, cpu, mem, diskp, nicp, hypervisor, **kwargs)
-    define_xml_str(xml)
+    try:
+        define_xml_str(xml)
+    except libvirtError as err:
+        # check if failure is due to this domain already existing
+        if "domain '{}' already exists".format(name) in str(err):
+            # continue on to seeding
+            log.warn(err)
+        else:
+            raise err  # a real error we should report upwards
 
-    if kwargs.get('seed') and seedable:
-        install = kwargs.get('install', True)
-        seed_cmd = kwargs.get('seed_cmd', 'seed.apply')
-
-        __salt__[seed_cmd](img_dest,
-                           id_=name,
-                           config=kwargs.get('config'),
-                           install=install)
+    if seed and seedable:
+        log.debug('Seed command is {0}'.format(seed_cmd))
+        __salt__[seed_cmd](
+           img_dest,
+           id_=name,
+           config=kwargs.get('config'),
+           install=install,
+           pub_key=pub_key,
+           priv_key=priv_key,
+        )
     if start:
+        log.debug('Creating {0}'.format(name))
         _get_domain(name).create()
 
     return True
@@ -874,7 +929,7 @@ def get_graphics(vm_):
            'keymap': 'None',
            'listen': 'None',
            'port': 'None',
-           'type': 'vnc'}
+           'type': 'None'}
     xml = get_xml(vm_)
     ssock = _StringIO(xml)
     doc = minidom.parse(ssock)
@@ -995,7 +1050,7 @@ def setmem(vm_, memory, config=False):
         salt '*' virt.setmem <domain> <size>
         salt '*' virt.setmem my_domain 768
     '''
-    if vm_state(vm_) != 'shutdown':
+    if vm_state(vm_)[vm_] != 'shutdown':
         return False
 
     dom = _get_domain(vm_)
@@ -1029,7 +1084,7 @@ def setvcpus(vm_, vcpus, config=False):
         salt '*' virt.setvcpus <domain> <amount>
         salt '*' virt.setvcpus my_domain 4
     '''
-    if vm_state(vm_) != 'shutdown':
+    if vm_state(vm_)[vm_] != 'shutdown':
         return False
 
     dom = _get_domain(vm_)
@@ -1286,9 +1341,11 @@ def create_xml_path(path):
 
         salt '*' virt.create_xml_path <path to XML file on the node>
     '''
-    if not os.path.isfile(path):
+    try:
+        with salt.utils.fopen(path, 'r') as fp_:
+            return create_xml_str(fp_.read())
+    except (OSError, IOError):
         return False
-    return create_xml_str(salt.utils.fopen(path, 'r').read())
 
 
 def define_xml_str(xml):
@@ -1316,9 +1373,11 @@ def define_xml_path(path):
         salt '*' virt.define_xml_path <path to XML file on the node>
 
     '''
-    if not os.path.isfile(path):
+    try:
+        with salt.utils.fopen(path, 'r') as fp_:
+            return define_xml_str(fp_.read())
+    except (OSError, IOError):
         return False
-    return define_xml_str(salt.utils.fopen(path, 'r').read())
 
 
 def define_vol_xml_str(xml):
@@ -1348,9 +1407,11 @@ def define_vol_xml_path(path):
         salt '*' virt.define_vol_xml_path <path to XML file on the node>
 
     '''
-    if not os.path.isfile(path):
+    try:
+        with salt.utils.fopen(path, 'r') as fp_:
+            return define_vol_xml_str(fp_.read())
+    except (OSError, IOError):
         return False
-    return define_vol_xml_str(salt.utils.fopen(path, 'r').read())
 
 
 def migrate_non_shared(vm_, target, ssh=False):
@@ -1540,8 +1601,9 @@ def is_kvm_hyper():
         salt '*' virt.is_kvm_hyper
     '''
     try:
-        if 'kvm_' not in salt.utils.fopen('/proc/modules').read():
-            return False
+        with salt.utils.fopen('/proc/modules') as fp_:
+            if 'kvm_' not in fp_.read():
+                return False
     except IOError:
         # No /proc/modules? Are we on Windows? Or Solaris?
         return False
@@ -1565,9 +1627,10 @@ def is_xen_hyper():
         # virtual_subtype isn't set everywhere.
         return False
     try:
-        if 'xen_' not in salt.utils.fopen('/proc/modules').read():
-            return False
-    except IOError:
+        with salt.utils.fopen('/proc/modules') as fp_:
+            if 'xen_' not in fp_.read():
+                return False
+    except (OSError, IOError):
         # No /proc/modules? Are we on Windows? Or Solaris?
         return False
     return 'libvirtd' in __salt__['cmd.run'](__grains__['ps'])
@@ -1795,7 +1858,7 @@ def list_snapshots(domain=None):
     '''
     List available snapshots for certain vm or for all.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -1823,7 +1886,7 @@ def snapshot(domain, name=None, suffix=None):
     * **suffix**: Add suffix for the new name. Useful in states, where such snapshots
                   can be distinguished from manually created.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -1857,7 +1920,7 @@ def delete_snapshots(name, *names, **kwargs):
 
     * **all**: Remove all snapshots. Values: True or False (default False).
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -1884,7 +1947,7 @@ def revert_snapshot(name, snapshot=None, cleanup=False):
 
     * **cleanup**: Remove all newer than reverted snapshots. Values: True or False (default False).
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -1942,53 +2005,90 @@ def revert_snapshot(name, snapshot=None, cleanup=False):
     return ret
 
 
-# Deprecated aliases
-def create(domain):
+def _capabilities():
     '''
-    .. deprecated:: Boron
-       Use :py:func:`~salt.modules.virt.start` instead.
+    Return connection capabilities
+    It's a huge klutz to parse right,
+    so hide func for now and pass on the XML instead
+    '''
+    conn = __get_conn()
+    caps = conn.getCapabilities()
+    caps = minidom.parseString(caps)
 
-    Start a defined domain
+    return caps
+
+
+def cpu_baseline(full=False, migratable=False, out='libvirt'):
+    '''
+    Return the optimal 'custom' CPU baseline config for VM's on this minion
+
+    .. versionadded:: 2016.3.0
+
+    :param full: Return all CPU features rather than the ones on top of the closest CPU model
+    :param migratable: Exclude CPU features that are unmigratable (libvirt 2.13+)
+    :param out: 'libvirt' (default) for usable libvirt XML definition, 'salt' for nice dict
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' virt.create <domain>
+        salt '*' virt.cpu_baseline
+
     '''
-    salt.utils.warn_until('Nitrogen', 'Use "virt.start" instead.')
-    return start(domain)
+    conn = __get_conn()
+    caps = _capabilities()
 
+    cpu = caps.getElementsByTagName('host')[0].getElementsByTagName('cpu')[0]
 
-def destroy(domain):
-    '''
-    .. deprecated:: Boron
-       Use :py:func:`~salt.modules.virt.stop` instead.
+    log.debug('Host CPU model definition: {0}'.format(cpu.toxml()))
 
-    Power off a defined domain
+    flags = 0
+    if migratable:
+        # This one is only in 1.2.14+
+        if getattr(libvirt, 'VIR_CONNECT_BASELINE_CPU_MIGRATABLE', False):
+            flags += libvirt.VIR_CONNECT_BASELINE_CPU_MIGRATABLE
+        else:
+            raise ValueError
 
-    CLI Example:
+    if full and getattr(libvirt, 'VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES', False):
+        # This one is only in 1.1.3+
+        flags += libvirt.VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES
 
-    .. code-block:: bash
+    cpu = conn.baselineCPU([cpu.toxml()], flags)
+    cpu = minidom.parseString(cpu).getElementsByTagName('cpu')
+    cpu = cpu[0]
 
-        salt '*' virt.destroy <domain>
-    '''
-    salt.utils.warn_until('Nitrogen', 'Use "virt.stop" instead.')
-    return stop(domain)
+    if full and not getattr(libvirt, 'VIR_CONNECT_BASELINE_CPU_EXPAND_FEATURES', False):
+        # Try do it by ourselves
+        # Find the models in cpu_map.xml and iterate over them for as long as entries have submodels
+        with salt.utils.fopen('/usr/share/libvirt/cpu_map.xml', 'r') as cpu_map:
+            cpu_map = minidom.parse(cpu_map)
 
+        cpu_model = cpu.getElementsByTagName('model')[0].childNodes[0].nodeValue
+        while cpu_model:
+            cpu_specs = [el for el in cpu_map.getElementsByTagName('model') if el.getAttribute('name') == cpu_model and el.hasChildNodes()]
 
-def list_vms():
-    '''
-    .. deprecated:: Boron
-       Use :py:func:`~salt.modules.virt.list_domains` instead.
+            if not len(cpu_specs):
+                raise ValueError('Model {0} not found in CPU map'.format(cpu_model))
+            elif len(cpu_specs) > 1:
+                raise ValueError('Multiple models {0} found in CPU map'.format(cpu_model))
 
-    List all virtual machines.
+            cpu_specs = cpu_specs[0]
 
-    CLI Example:
+            cpu_model = cpu_specs.getElementsByTagName('model')
+            if not len(cpu_model):
+                cpu_model = None
+            else:
+                cpu_model = cpu_model[0].getAttribute('name')
 
-    .. code-block:: bash
+            for feature in cpu_specs.getElementsByTagName('feature'):
+                cpu.appendChild(feature)
 
-        salt '*' virt.list_vms <domain>
-    '''
-    salt.utils.warn_until('Nitrogen', 'Use "virt.list_domains" instead.')
-    return list_domains()
+    if out == 'libvirt':
+        return cpu.toxml()
+    elif out == 'salt':
+        return {
+            'model': cpu.getElementsByTagName('model')[0].childNodes[0].nodeValue,
+            'vendor': cpu.getElementsByTagName('vendor')[0].childNodes[0].nodeValue,
+            'features': [feature.getAttribute('name') for feature in cpu.getElementsByTagName('feature')]
+        }

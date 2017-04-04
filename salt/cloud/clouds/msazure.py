@@ -6,7 +6,7 @@ Azure Cloud Module
 The Azure cloud module is used to control access to Microsoft Azure
 
 :depends:
-    * `Microsoft Azure SDK for Python <https://pypi.python.org/pypi/azure/0.9.0>`_ >= 0.11.1
+    * `Microsoft Azure SDK for Python <https://pypi.python.org/pypi/azure/1.0.2>`_ >= 1.0.2
     * python-requests, for Python < 2.7.9
 :configuration:
     Required provider parameters:
@@ -14,7 +14,7 @@ The Azure cloud module is used to control access to Microsoft Azure
     * ``apikey``
     * ``certificate_path``
     * ``subscription_id``
-    * ``requests_lib``
+    * ``backend``
 
     A Management Certificate (.pem and .crt files) must be created and the .pem
     file placed on the same machine that salt-cloud is run from. Information on
@@ -23,7 +23,7 @@ The Azure cloud module is used to control access to Microsoft Azure
 
     http://www.windowsazure.com/en-us/develop/python/how-to-guides/service-management/
 
-    For users with Python < 2.7.9, requests_lib must currently be set to True.
+    For users with Python < 2.7.9, ``backend`` must currently be set to ``requests``.
 
 Example ``/etc/salt/cloud.providers`` or
 ``/etc/salt/cloud.providers.d/azure.conf`` configuration:
@@ -57,9 +57,9 @@ try:
     import azure
     import azure.storage
     import azure.servicemanagement
-    from azure import (WindowsAzureConflictError,
-                       WindowsAzureMissingResourceError,
-                       WindowsAzureError)
+    from azure.common import (AzureConflictHttpError,
+                       AzureMissingResourceHttpError,
+                       AzureException)
     import salt.utils.msazure
     from salt.utils.msazure import object_to_dict
     HAS_LIBS = True
@@ -223,7 +223,7 @@ def list_nodes(conn=None, call=None):
     for node in nodes:
         ret[node] = {'name': node}
         for prop in ('id', 'image', 'size', 'state', 'private_ips', 'public_ips'):
-            ret[node][prop] = nodes[node][prop]
+            ret[node][prop] = nodes[node].get(prop)
     return ret
 
 
@@ -399,7 +399,12 @@ def show_instance(name, call=None):
     # Find under which cloud service the name is listed, if any
     if name not in nodes:
         return {}
-    salt.utils.cloud.cache_node(nodes[name], __active_provider_name__, __opts__)
+    if 'name' not in nodes[name]:
+        nodes[name]['name'] = nodes[name]['id']
+    try:
+        __utils__['cloud.cache_node'](nodes[name], __active_provider_name__, __opts__)
+    except TypeError:
+        log.warning('Unable to show cache node data; this may be because the node has been deleted')
     return nodes[name]
 
 
@@ -411,25 +416,18 @@ def create(vm_):
         # Check for required profile parameters before sending any API calls.
         if vm_['profile'] and config.is_profile_configured(__opts__,
                                                            __active_provider_name__ or 'azure',
-                                                           vm_['profile']) is False:
+                                                           vm_['profile'],
+                                                           vm_=vm_) is False:
             return False
     except AttributeError:
         pass
 
-    # Since using "provider: <provider-engine>" is deprecated, alias provider
-    # to use driver: "driver: <provider-engine>"
-    if 'provider' in vm_:
-        vm_['driver'] = vm_.pop('provider')
-
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'starting create',
         'salt/cloud/{0}/creating'.format(vm_['name']),
-        {
-            'name': vm_['name'],
-            'profile': vm_['profile'],
-            'provider': vm_['driver'],
-        },
+        args=__utils__['cloud.filter_event']('creating', vm_, ['name', 'profile', 'provider', 'driver']),
+        sock_dir=__opts__['sock_dir'],
         transport=__opts__['transport']
     )
 
@@ -461,13 +459,13 @@ def create(vm_):
         )
 
     ssh_port = config.get_cloud_config_value('port', vm_, __opts__,
-                                             default='22', search_global=True)
+                                             default=22, search_global=True)
 
     ssh_endpoint = azure.servicemanagement.ConfigurationSetInputEndpoint(
         name='SSH',
         protocol='TCP',
         port=ssh_port,
-        local_port='22',
+        local_port=22,
     )
 
     network_config = azure.servicemanagement.ConfigurationSet()
@@ -480,9 +478,24 @@ def create(vm_):
             admin_username=vm_['win_username'],
             admin_password=vm_['win_password'],
         )
+
+        smb_port = '445'
+        if 'smb_port' in vm_:
+            smb_port = vm_['smb_port']
+
+        smb_endpoint = azure.servicemanagement.ConfigurationSetInputEndpoint(
+            name='SMB',
+            protocol='TCP',
+            port=smb_port,
+            local_port=smb_port,
+        )
+
+        network_config.input_endpoints.input_endpoints.append(smb_endpoint)
+
         # Domain and WinRM configuration not yet supported by Salt Cloud
         system_config.domain_join = None
         system_config.win_rm = None
+
     else:
         system_config = azure.servicemanagement.LinuxConfigurationSet(
             host_name=vm_['name'],
@@ -521,21 +534,21 @@ def create(vm_):
     del event_kwargs['vm_kwargs']['system_config']
     del event_kwargs['vm_kwargs']['os_virtual_hard_disk']
     del event_kwargs['vm_kwargs']['network_config']
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'requesting instance',
         'salt/cloud/{0}/requesting'.format(vm_['name']),
-        event_kwargs,
+        args=__utils__['cloud.filter_event']('requesting', event_kwargs, event_kwargs.keys()),
+        sock_dir=__opts__['sock_dir'],
         transport=__opts__['transport']
     )
     log.debug('vm_kwargs: {0}'.format(vm_kwargs))
 
     # Azure lets you open winrm on a new VM
     # Can open up specific ports in Azure; but not on Windows
-
     try:
         conn.create_hosted_service(**service_kwargs)
-    except WindowsAzureConflictError:
+    except AzureConflictHttpError:
         log.debug('Cloud service already exists')
     except Exception as exc:
         error = 'The hosted service name is invalid.'
@@ -565,11 +578,12 @@ def create(vm_):
         result = conn.create_virtual_machine_deployment(**vm_kwargs)
         log.debug('Request ID for machine: {0}'.format(result.request_id))
         _wait_for_async(conn, result.request_id)
-    except WindowsAzureConflictError:
+    except AzureConflictHttpError:
         log.debug('Conflict error. The deployment may already exist, trying add_role')
         # Deleting two useless keywords
         del vm_kwargs['deployment_slot']
         del vm_kwargs['label']
+        del vm_kwargs['virtual_network_name']
         result = conn.add_role(**vm_kwargs)
         _wait_for_async(conn, result.request_id)
     except Exception as exc:
@@ -610,7 +624,7 @@ def create(vm_):
             data = show_instance(vm_['name'], call='action')
             if 'url' in data and data['url'] != str(''):
                 return data['url']
-        except WindowsAzureMissingResourceError:
+        except AzureMissingResourceHttpError:
             pass
         time.sleep(1)
         return False
@@ -629,18 +643,19 @@ def create(vm_):
     vm_['password'] = config.get_cloud_config_value(
         'ssh_password', vm_, __opts__
     )
-    ret = salt.utils.cloud.bootstrap(vm_, __opts__)
+    ret = __utils__['cloud.bootstrap'](vm_, __opts__)
 
     # Attaching volumes
     volumes = config.get_cloud_config_value(
         'volumes', vm_, __opts__, search_global=True
     )
     if volumes:
-        salt.utils.cloud.fire_event(
+        __utils__['cloud.fire_event'](
             'event',
             'attaching volumes',
             'salt/cloud/{0}/attaching_volumes'.format(vm_['name']),
-            {'volumes': volumes},
+            args=__utils__['cloud.filter_event']('attaching_volumes', vm_, ['volumes']),
+            sock_dir=__opts__['sock_dir'],
             transport=__opts__['transport']
         )
 
@@ -669,15 +684,12 @@ def create(vm_):
 
     ret.update(data)
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'created instance',
         'salt/cloud/{0}/created'.format(vm_['name']),
-        {
-            'name': vm_['name'],
-            'profile': vm_['profile'],
-            'provider': vm_['driver'],
-        },
+        args=__utils__['cloud.filter_event']('created', vm_, ['name', 'profile', 'provider', 'driver']),
+        sock_dir=__opts__['sock_dir'],
         transport=__opts__['transport']
     )
 
@@ -885,7 +897,7 @@ def _wait_for_async(conn, request_id):
         result = conn.get_operation_status(request_id)
 
     if result.status != 'Succeeded':
-        raise WindowsAzureError('Operation failed. {message} ({code})'
+        raise AzureException('Operation failed. {message} ({code})'
                                 .format(message=result.error.message,
                                         code=result.error.code))
 
@@ -924,11 +936,11 @@ def destroy(name, conn=None, call=None, kwargs=None):
         log.debug('Deleting role')
         result = conn.delete_role(service_name, service_name, name)
         delete_type = 'delete_role'
-    except WindowsAzureError:
+    except AzureException:
         log.debug('Failed to delete role, deleting deployment')
         try:
             result = conn.delete_deployment(service_name, service_name)
-        except WindowsAzureConflictError as exc:
+        except AzureConflictHttpError as exc:
             log.error(exc.message)
             raise SaltCloudSystemExit('{0}: {1}'.format(name, exc.message))
         delete_type = 'delete_deployment'
@@ -937,7 +949,7 @@ def destroy(name, conn=None, call=None, kwargs=None):
         delete_type: {'request_id': result.request_id},
     }
     if __opts__.get('update_cachedir', False) is True:
-        salt.utils.cloud.delete_minion_cachedir(name, __active_provider_name__.split(':')[0], __opts__)
+        __utils__['cloud.delete_minion_cachedir'](name, __active_provider_name__.split(':')[0], __opts__)
 
     cleanup_disks = config.get_cloud_config_value(
         'cleanup_disks',
@@ -959,7 +971,7 @@ def destroy(name, conn=None, call=None, kwargs=None):
             try:
                 data = delete_disk(kwargs={'name': disk_name, 'delete_vhd': cleanup_vhds}, call='function')
                 return data
-            except WindowsAzureConflictError:
+            except AzureConflictHttpError:
                 log.debug('Waiting for VM to be destroyed...')
             time.sleep(5)
             return False
@@ -990,7 +1002,7 @@ def destroy(name, conn=None, call=None, kwargs=None):
                 try:
                     data = delete_service(kwargs={'name': service_name}, call='function')
                     return data
-                except WindowsAzureConflictError:
+                except AzureConflictHttpError:
                     log.debug('Waiting for disk to be deleted...')
                 time.sleep(5)
                 return False
@@ -1170,11 +1182,10 @@ def show_storage_keys(kwargs=None, conn=None, call=None):
         data = conn.get_storage_account_keys(
             kwargs['name'],
         )
-    except WindowsAzureMissingResourceError as exc:
+    except AzureMissingResourceHttpError as exc:
         storage_data = show_storage(kwargs={'name': kwargs['name']}, call='function')
         if storage_data['storage_service_properties']['status'] == 'Creating':
-            msg = 'The storage account keys have not yet been created'
-            raise SaltCloudSystemExit(msg)
+            raise SaltCloudSystemExit('The storage account keys have not yet been created.')
         else:
             raise SaltCloudSystemExit('{0}: {1}'.format(kwargs['name'], exc.message))
     return object_to_dict(data)
@@ -1232,9 +1243,8 @@ def create_storage(kwargs=None, conn=None, call=None):
             account_type=kwargs.get('account_type', 'Standard_GRS'),
         )
         return {'Success': 'The storage account was successfully created'}
-    except WindowsAzureConflictError as exc:
-        msg = 'There was a Conflict. This usually means that the storage account already exists.'
-        raise SaltCloudSystemExit(msg)
+    except AzureConflictHttpError:
+        raise SaltCloudSystemExit('There was a conflict. This usually means that the storage account already exists.')
 
 
 def update_storage(kwargs=None, conn=None, call=None):
@@ -1310,9 +1320,8 @@ def regenerate_storage_keys(kwargs=None, conn=None, call=None):
             key_type=kwargs['key_type'],
         )
         return show_storage_keys(kwargs={'name': kwargs['name']}, call='function')
-    except WindowsAzureConflictError as exc:
-        msg = 'There was a Conflict. This usually means that the storage account already exists.'
-        raise SaltCloudSystemExit(msg)
+    except AzureConflictHttpError:
+        raise SaltCloudSystemExit('There was a conflict. This usually means that the storage account already exists.')
 
 
 def delete_storage(kwargs=None, conn=None, call=None):
@@ -1344,7 +1353,7 @@ def delete_storage(kwargs=None, conn=None, call=None):
     try:
         data = conn.delete_storage_account(kwargs['name'])
         return {'Success': 'The storage account was successfully deleted'}
-    except WindowsAzureMissingResourceError as exc:
+    except AzureMissingResourceHttpError as exc:
         raise SaltCloudSystemExit('{0}: {1}'.format(kwargs['name'], exc.message))
 
 
@@ -1402,15 +1411,12 @@ def show_service(kwargs=None, conn=None, call=None):
     if 'name' not in kwargs:
         raise SaltCloudSystemExit('A name must be specified as "name"')
 
-    try:
-        data = conn.get_hosted_service_properties(
-            kwargs['name'],
-            kwargs.get('details', False)
-        )
-        ret = object_to_dict(data)
-        return ret
-    except WindowsAzureMissingResourceError as exc:
-        raise SaltCloudSystemExit('{0}: {1}'.format(kwargs['name'], exc.message))
+    data = conn.get_hosted_service_properties(
+        kwargs['name'],
+        kwargs.get('details', False)
+    )
+    ret = object_to_dict(data)
+    return ret
 
 
 def create_service(kwargs=None, conn=None, call=None):
@@ -1456,9 +1462,8 @@ def create_service(kwargs=None, conn=None, call=None):
             kwargs.get('extended_properties', None),
         )
         return {'Success': 'The service was successfully created'}
-    except WindowsAzureConflictError as exc:
-        msg = 'There was a Conflict. This usually means that the service already exists.'
-        raise SaltCloudSystemExit(msg)
+    except AzureConflictHttpError:
+        raise SaltCloudSystemExit('There was a conflict. This usually means that the service already exists.')
 
 
 def delete_service(kwargs=None, conn=None, call=None):
@@ -1488,9 +1493,9 @@ def delete_service(kwargs=None, conn=None, call=None):
         conn = get_conn()
 
     try:
-        data = conn.delete_hosted_service(kwargs['name'])
+        conn.delete_hosted_service(kwargs['name'])
         return {'Success': 'The service was successfully deleted'}
-    except WindowsAzureMissingResourceError as exc:
+    except AzureMissingResourceHttpError as exc:
         raise SaltCloudSystemExit('{0}: {1}'.format(kwargs['name'], exc.message))
 
 
@@ -1547,11 +1552,8 @@ def show_disk(kwargs=None, conn=None, call=None):
     if 'name' not in kwargs:
         raise SaltCloudSystemExit('A name must be specified as "name"')
 
-    try:
-        data = conn.get_disk(kwargs['name'])
-        return object_to_dict(data)
-    except WindowsAzureMissingResourceError as exc:
-        raise SaltCloudSystemExit('{0}: {1}'.format(kwargs['name'], exc.message))
+    data = conn.get_disk(kwargs['name'])
+    return object_to_dict(data)
 
 
 # For consistency with Azure SDK
@@ -1585,7 +1587,7 @@ def cleanup_unattached_disks(kwargs=None, conn=None, call=None):
     for disk in disks:
         if disks[disk]['attached_to'] is None:
             del_kwargs = {
-                'name': disks[disk]['name'][0],
+                'name': disks[disk]['name'],
                 'delete_vhd': kwargs.get('delete_vhd', False)
             }
             log.info('Deleting disk {name}, deleting VHD: {delete_vhd}'.format(**del_kwargs))
@@ -1623,7 +1625,7 @@ def delete_disk(kwargs=None, conn=None, call=None):
     try:
         data = conn.delete_disk(kwargs['name'], kwargs.get('delete_vhd', False))
         return {'Success': 'The disk was successfully deleted'}
-    except WindowsAzureMissingResourceError as exc:
+    except AzureMissingResourceHttpError as exc:
         raise SaltCloudSystemExit('{0}: {1}'.format(kwargs['name'], exc.message))
 
 
@@ -1692,14 +1694,11 @@ def list_service_certificates(kwargs=None, conn=None, call=None):
     if not conn:
         conn = get_conn()
 
-    try:
-        data = conn.list_service_certificates(service_name=kwargs['name'])
-        ret = {}
-        for item in data.certificates:
-            ret[item.thumbprint] = object_to_dict(item)
-        return ret
-    except WindowsAzureMissingResourceError as exc:
-        raise SaltCloudSystemExit('{0}: {1}'.format(kwargs['name'], exc.message))
+    data = conn.list_service_certificates(service_name=kwargs['name'])
+    ret = {}
+    for item in data.certificates:
+        ret[item.thumbprint] = object_to_dict(item)
+    return ret
 
 
 def show_service_certificate(kwargs=None, conn=None, call=None):
@@ -1791,9 +1790,9 @@ def add_service_certificate(kwargs=None, conn=None, call=None):
             kwargs['password'],
         )
         return {'Success': 'The service certificate was successfully added'}
-    except WindowsAzureConflictError as exc:
-        msg = 'There was a Conflict. This usually means that the service certificate already exists.'
-        raise SaltCloudSystemExit(msg)
+    except AzureConflictHttpError:
+        raise SaltCloudSystemExit('There was a conflict. This usually means that the '
+                                  'service certificate already exists.')
 
 
 def delete_service_certificate(kwargs=None, conn=None, call=None):
@@ -1836,7 +1835,7 @@ def delete_service_certificate(kwargs=None, conn=None, call=None):
             kwargs['thumbprint'],
         )
         return {'Success': 'The service certificate was successfully deleted'}
-    except WindowsAzureMissingResourceError as exc:
+    except AzureMissingResourceHttpError as exc:
         raise SaltCloudSystemExit('{0}: {1}'.format(kwargs['name'], exc.message))
 
 
@@ -1936,15 +1935,15 @@ def add_management_certificate(kwargs=None, conn=None, call=None):
         raise SaltCloudSystemExit('Certificate data must be specified as "data"')
 
     try:
-        data = conn.add_management_certificate(
+        conn.add_management_certificate(
             kwargs['name'],
             kwargs['thumbprint'],
             kwargs['data'],
         )
         return {'Success': 'The management certificate was successfully added'}
-    except WindowsAzureConflictError as exc:
-        msg = 'There was a Conflict. This usually means that the management certificate already exists.'
-        raise SaltCloudSystemExit(msg)
+    except AzureConflictHttpError:
+        raise SaltCloudSystemExit('There was a conflict. '
+                                  'This usually means that the management certificate already exists.')
 
 
 def delete_management_certificate(kwargs=None, conn=None, call=None):
@@ -1975,9 +1974,9 @@ def delete_management_certificate(kwargs=None, conn=None, call=None):
         conn = get_conn()
 
     try:
-        data = conn.delete_management_certificate(kwargs['thumbprint'])
+        conn.delete_management_certificate(kwargs['thumbprint'])
         return {'Success': 'The management certificate was successfully deleted'}
-    except WindowsAzureMissingResourceError as exc:
+    except AzureMissingResourceHttpError as exc:
         raise SaltCloudSystemExit('{0}: {1}'.format(kwargs['thumbprint'], exc.message))
 
 
@@ -2047,11 +2046,14 @@ def list_input_endpoints(kwargs=None, conn=None, call=None):
     for item in data:
         if 'Role' not in item:
             continue
-        input_endpoint = item['Role']['ConfigurationSets']['ConfigurationSet']['InputEndpoints']['InputEndpoint']
-        if not isinstance(input_endpoint, list):
-            input_endpoint = [input_endpoint]
-        for endpoint in input_endpoint:
-            ret[endpoint['Name']] = endpoint
+        for role in item['Role']:
+            input_endpoint = role['ConfigurationSets']['ConfigurationSet'].get('InputEndpoints', {}).get('InputEndpoint')
+            if not input_endpoint:
+                continue
+            if not isinstance(input_endpoint, list):
+                input_endpoint = [input_endpoint]
+            for endpoint in input_endpoint:
+                ret[endpoint['Name']] = endpoint
     return ret
 
 
@@ -2382,16 +2384,15 @@ def create_affinity_group(kwargs=None, conn=None, call=None):
         raise SaltCloudSystemExit('A location must be specified as "location"')
 
     try:
-        data = conn.create_affinity_group(
+        conn.create_affinity_group(
             kwargs['name'],
             kwargs['label'],
             kwargs['location'],
             kwargs.get('description', None),
         )
         return {'Success': 'The affinity group was successfully created'}
-    except WindowsAzureConflictError as exc:
-        msg = 'There was a Conflict. This usually means that the affinity group already exists.'
-        raise SaltCloudSystemExit(msg)
+    except AzureConflictHttpError:
+        raise SaltCloudSystemExit('There was a conflict. This usually means that the affinity group already exists.')
 
 
 def update_affinity_group(kwargs=None, conn=None, call=None):
@@ -2423,7 +2424,7 @@ def update_affinity_group(kwargs=None, conn=None, call=None):
     if 'label' not in kwargs:
         raise SaltCloudSystemExit('A label must be specified as "label"')
 
-    data = conn.update_affinity_group(
+    conn.update_affinity_group(
         affinity_group_name=kwargs['name'],
         label=kwargs['label'],
         description=kwargs.get('description', None),
@@ -2458,9 +2459,9 @@ def delete_affinity_group(kwargs=None, conn=None, call=None):
         conn = get_conn()
 
     try:
-        data = conn.delete_affinity_group(kwargs['name'])
+        conn.delete_affinity_group(kwargs['name'])
         return {'Success': 'The affinity group was successfully deleted'}
-    except WindowsAzureMissingResourceError as exc:
+    except AzureMissingResourceHttpError as exc:
         raise SaltCloudSystemExit('{0}: {1}'.format(kwargs['name'], exc.message))
 
 
@@ -2602,16 +2603,15 @@ def create_storage_container(kwargs=None, storage_conn=None, call=None):
         storage_conn = get_storage_conn(conn_kwargs=kwargs)
 
     try:
-        data = storage_conn.create_container(
+        storage_conn.create_container(
             container_name=kwargs['name'],
             x_ms_meta_name_values=kwargs.get('meta_name_values', None),
             x_ms_blob_public_access=kwargs.get('blob_public_access', None),
             fail_on_exist=kwargs.get('fail_on_exist', False),
         )
         return {'Success': 'The storage container was successfully created'}
-    except WindowsAzureConflictError as exc:
-        msg = 'There was a Conflict. This usually means that the storage container already exists.'
-        raise SaltCloudSystemExit(msg)
+    except AzureConflictHttpError:
+        raise SaltCloudSystemExit('There was a conflict. This usually means that the storage container already exists.')
 
 
 def show_storage_container(kwargs=None, storage_conn=None, call=None):
@@ -2744,9 +2744,8 @@ def set_storage_container_metadata(kwargs=None, storage_conn=None, call=None):
             x_ms_lease_id=kwargs.get('lease_id', None),
         )
         return {'Success': 'The storage container was successfully updated'}
-    except WindowsAzureConflictError as exc:
-        msg = 'There was a Conflict.'
-        raise SaltCloudSystemExit(msg)
+    except AzureConflictHttpError:
+        raise SaltCloudSystemExit('There was a conflict.')
 
 
 def show_storage_container_acl(kwargs=None, storage_conn=None, call=None):
@@ -2830,9 +2829,8 @@ def set_storage_container_acl(kwargs=None, storage_conn=None, call=None):
             x_ms_lease_id=kwargs.get('lease_id', None),
         )
         return {'Success': 'The storage container was successfully updated'}
-    except WindowsAzureConflictError as exc:
-        msg = 'There was a Conflict.'
-        raise SaltCloudSystemExit(msg)
+    except AzureConflictHttpError:
+        raise SaltCloudSystemExit('There was a conflict.')
 
 
 def delete_storage_container(kwargs=None, storage_conn=None, call=None):
@@ -3143,12 +3141,8 @@ def show_blob_properties(kwargs=None, storage_conn=None, call=None):
             blob_name=kwargs['blob'],
             x_ms_lease_id=kwargs.get('lease_id', None),
         )
-    except WindowsAzureMissingResourceError as exc:
-        raise SaltCloudSystemExit('{0}\\\\{1}: {2}'.format(
-            kwargs['container'],
-            kwargs['blob'],
-            exc.message,
-        ))
+    except AzureMissingResourceHttpError:
+        raise SaltCloudSystemExit('The specified blob does not exist.')
 
     return data
 
@@ -3332,7 +3326,7 @@ def get_blob(kwargs=None, storage_conn=None, call=None):
         Required if the blob has an active lease.
     progress_callback:
         callback for progress with signature function(current, total) where
-        current is the number of bytes transfered so far, and total is the
+        current is the number of bytes transferred so far, and total is the
         size of the blob.
     max_connections:
         Maximum number of parallel connections to use when the blob size
@@ -3394,6 +3388,14 @@ def query(path, method='GET', data=None, params=None, header_dict=None, decode=T
         'requests_lib',
         get_configured_provider(), __opts__, search_global=False
     )
+    if requests_lib is not None:
+        salt.utils.warn_until('Oxygen', '"requests_lib:True" has been replaced by "backend:requests", '
+                                        'please change your config')
+
+    backend = config.get_cloud_config_value(
+        'backend',
+        get_configured_provider(), __opts__, search_global=False
+    )
     url = 'https://{management_host}/{subscription_id}/{path}'.format(
         management_host=management_host,
         subscription_id=subscription_id,
@@ -3415,6 +3417,7 @@ def query(path, method='GET', data=None, params=None, header_dict=None, decode=T
         text=True,
         cert=certificate_path,
         requests_lib=requests_lib,
+        backend=backend,
         decode=decode,
         decode_type='xml',
     )

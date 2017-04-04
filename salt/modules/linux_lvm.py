@@ -22,7 +22,7 @@ def __virtual__():
     '''
     if salt.utils.which('lvm'):
         return __virtualname__
-    return False
+    return (False, 'The linux_lvm execution module cannot be loaded: the lvm binary is not in the path.')
 
 
 def version():
@@ -56,13 +56,21 @@ def fullversion():
     out = __salt__['cmd.run'](cmd).splitlines()
     for line in out:
         comps = line.split(':')
-    ret[comps[0].strip()] = comps[1].strip()
+        ret[comps[0].strip()] = comps[1].strip()
     return ret
 
 
-def pvdisplay(pvname=''):
+def pvdisplay(pvname='', real=False):
     '''
     Return information about the physical volume(s)
+
+    pvname
+        physical device name
+    real
+        dereference any symlinks and report the real device
+
+        .. versionadded:: 2015.8.7
+
 
     CLI Examples:
 
@@ -84,7 +92,11 @@ def pvdisplay(pvname=''):
     for line in out:
         if 'is a new physical volume' not in line:
             comps = line.strip().split(':')
-            ret[comps[0]] = {
+            if real:
+                device = os.path.realpath(comps[0])
+            else:
+                device = comps[0]
+            ret[device] = {
                 'Physical Volume Device': comps[0],
                 'Volume Group Name': comps[1],
                 'Physical Volume Size (kB)': comps[2],
@@ -97,6 +109,8 @@ def pvdisplay(pvname=''):
                 'Free Physical Extents': comps[9],
                 'Allocated Physical Extents': comps[10],
                 }
+            if real:
+                ret[device]['Real Physical Volume Device'] = device
     return ret
 
 
@@ -191,7 +205,7 @@ def pvcreate(devices, override=True, **kwargs):
     Set a physical device to be used as an LVM physical volume
 
     override
-        Skip devices, if they are already an LVM physical volumes
+        Skip devices, if they are already LVM physical volumes
 
     CLI Examples:
 
@@ -202,18 +216,19 @@ def pvcreate(devices, override=True, **kwargs):
     '''
     if not devices:
         return 'Error: at least one device is required'
+    if isinstance(devices, six.string_types):
+        devices = devices.split(',')
 
-    cmd = ['pvcreate']
-    for device in devices.split(','):
+    cmd = ['pvcreate', '-y']
+    for device in devices:
         if not os.path.exists(device):
             raise CommandExecutionError('{0} does not exist'.format(device))
-        # Verify pvcreate was successful
         if not pvdisplay(device):
             cmd.append(device)
         elif not override:
             raise CommandExecutionError('Device "{0}" is already an LVM physical volume.'.format(device))
 
-    if not cmd[1:]:
+    if not cmd[2:]:
         # All specified devices are already LVM volumes
         return True
 
@@ -230,7 +245,7 @@ def pvcreate(devices, override=True, **kwargs):
         raise CommandExecutionError(out.get('stderr'))
 
     # Verify pvcreate was successful
-    for device in devices.split(','):
+    for device in devices:
         if not pvdisplay(device):
             raise CommandExecutionError('Device "{0}" was not affected.'.format(device))
 
@@ -242,7 +257,7 @@ def pvremove(devices, override=True):
     Remove a physical device being used as an LVM physical volume
 
     override
-        Skip devices, if they are already not used as an LVM physical volumes
+        Skip devices, if they are already not used as LVM physical volumes
 
     CLI Examples:
 
@@ -250,8 +265,11 @@ def pvremove(devices, override=True):
 
         salt mymachine lvm.pvremove /dev/sdb1,/dev/sdb2
     '''
+    if isinstance(devices, six.string_types):
+        devices = devices.split(',')
+
     cmd = ['pvremove', '-y']
-    for device in devices.split(','):
+    for device in devices:
         if pvdisplay(device):
             cmd.append(device)
         elif not override:
@@ -266,7 +284,7 @@ def pvremove(devices, override=True):
         raise CommandExecutionError(out.get('stderr'))
 
     # Verify pvcremove was successful
-    for device in devices.split(','):
+    for device in devices:
         if pvdisplay(device):
             raise CommandExecutionError('Device "{0}" was not affected.'.format(device))
 
@@ -286,9 +304,11 @@ def vgcreate(vgname, devices, **kwargs):
     '''
     if not vgname or not devices:
         return 'Error: vgname and device(s) are both required'
+    if isinstance(devices, six.string_types):
+        devices = devices.split(',')
 
     cmd = ['vgcreate', vgname]
-    for device in devices.split(','):
+    for device in devices:
         cmd.append(device)
     valid = ('clustered', 'maxlogicalvolumes', 'maxphysicalvolumes',
              'vgmetadatacopies', 'metadatacopies', 'physicalextentsize')
@@ -315,16 +335,26 @@ def vgextend(vgname, devices):
     '''
     if not vgname or not devices:
         return 'Error: vgname and device(s) are both required'
+    if isinstance(devices, six.string_types):
+        devices = devices.split(',')
 
     cmd = ['vgextend', vgname]
-    for device in devices.split(','):
+    for device in devices:
         cmd.append(device)
     out = __salt__['cmd.run'](cmd, python_shell=False).splitlines()
     vgdata = {'Output from vgextend': out[0].strip()}
     return vgdata
 
 
-def lvcreate(lvname, vgname, size=None, extents=None, snapshot=None, pv=None, **kwargs):
+def lvcreate(lvname,
+             vgname,
+             size=None,
+             extents=None,
+             snapshot=None,
+             pv=None,
+             thinvolume=False,
+             thinpool=False,
+             **kwargs):
     '''
     Create a new logical volume, with option for which physical volume to be used
 
@@ -332,19 +362,33 @@ def lvcreate(lvname, vgname, size=None, extents=None, snapshot=None, pv=None, **
 
     .. code-block:: bash
 
-        salt '*' lvm.lvcreate new_volume_name vg_name size=10G
-        salt '*' lvm.lvcreate new_volume_name vg_name extents=100 pv=/dev/sdb
-        salt '*' lvm.lvcreate new_snapshot    vg_name snapshot=volume_name size=3G
+        salt '*' lvm.lvcreate new_volume_name     vg_name size=10G
+        salt '*' lvm.lvcreate new_volume_name     vg_name extents=100 pv=/dev/sdb
+        salt '*' lvm.lvcreate new_snapshot        vg_name snapshot=volume_name size=3G
+
+    .. versionadded:: to_complete
+
+    Support for thin pools and thin volumes
+
+    CLI Examples:
+
+    .. code-block:: bash
+
+        salt '*' lvm.lvcreate new_thinpool_name   vg_name               size=20G thinpool=True
+        salt '*' lvm.lvcreate new_thinvolume_name vg_name/thinpool_name size=10G thinvolume=True
+
     '''
     if size and extents:
         return 'Error: Please specify only one of size or extents'
+    if thinvolume and thinpool:
+        return 'Error: Please set only one of thinvolume or thinpool to True'
 
     valid = ('activate', 'chunksize', 'contiguous', 'discards', 'stripes',
              'stripesize', 'minor', 'persistent', 'mirrors', 'noudevsync',
              'monitor', 'ignoremonitoring', 'permission', 'poolmetadatasize',
-             'readahead', 'regionsize', 'thin', 'thinpool', 'type',
+             'readahead', 'regionsize', 'type',
              'virtualsize', 'zero')
-    no_parameter = ('noudevsync', 'ignoremonitoring', )
+    no_parameter = ('noudevsync', 'ignoremonitoring', 'thin', )
 
     extra_arguments = []
     if kwargs:
@@ -354,14 +398,25 @@ def lvcreate(lvname, vgname, size=None, extents=None, snapshot=None, pv=None, **
             elif k in valid:
                 extra_arguments.extend(['--{0}'.format(k), '{0}'.format(v)])
 
-    cmd = [salt.utils.which('lvcreate'), '-n', lvname]
+    cmd = [salt.utils.which('lvcreate')]
+
+    if thinvolume:
+        cmd.extend(['--thin', '-n', lvname])
+    elif thinpool:
+        cmd.extend(['--thinpool', lvname])
+    else:
+        cmd.extend(['-n', lvname])
 
     if snapshot:
         cmd.extend(['-s', '{0}/{1}'.format(vgname, snapshot)])
     else:
         cmd.append(vgname)
 
-    if size:
+    if size and thinvolume:
+        cmd.extend(['-V', '{0}'.format(size)])
+    elif extents and thinvolume:
+        return 'Error: Thin volume size cannot be specified as extents'
+    elif size:
         cmd.extend(['-L', '{0}'.format(size)])
     elif extents:
         cmd.extend(['-l', '{0}'.format(extents)])

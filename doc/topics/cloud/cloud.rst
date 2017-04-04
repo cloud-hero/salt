@@ -112,14 +112,14 @@ then the necessary port to log in, then a successful login that can be used to
 install Salt. Minion configuration and keys will then be uploaded to a temporary
 directory on the target by the appropriate function. On a Windows target, the
 Windows Minion Installer will be run in silent mode. On a Linux/Unix target, a
-deploy script (bootstrap-salt.sh, by default) will be run, which will
+deploy script (``bootstrap-salt.sh``, by default) will be run, which will
 auto-detect the operating system, and install Salt using its native package
 manager. These do not need to be handled by the developer in the cloud module.
 
 The ``salt.utils.cloud.validate_windows_cred()`` function has been extended to
 take the number of retries and retry_delay parameters in case a specific cloud
 host has a delay between providing the Windows credentials and the
-credentials being available for use.  In their ``create()`` function, or as a
+credentials being available for use.  In their ``create()`` function, or as
 a sub-function called during the creation process, developers should use the
 ``win_deploy_auth_retries`` and ``win_deploy_auth_retry_delay`` parameters from
 the provider configuration to allow the end-user the ability to customize the

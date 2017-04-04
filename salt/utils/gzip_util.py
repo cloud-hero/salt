@@ -11,7 +11,8 @@ from __future__ import absolute_import
 import gzip
 
 # Import 3rd-party libs
-from salt.ext.six.moves import StringIO  # pylint: disable=import-error
+import salt.ext.six as six
+from salt.ext.six import BytesIO
 
 
 class GzipFile(gzip.GzipFile):
@@ -51,15 +52,17 @@ def compress(data, compresslevel=9):
     '''
     Returns the data compressed at gzip level compression.
     '''
-    buf = StringIO()
+    buf = BytesIO()
     with open_fileobj(buf, 'wb', compresslevel) as ogz:
+        if six.PY3 and not isinstance(data, bytes):
+            data = data.encode(__salt_system_encoding__)
         ogz.write(data)
     compressed = buf.getvalue()
     return compressed
 
 
 def uncompress(data):
-    buf = StringIO(data)
+    buf = BytesIO(data)
     with open_fileobj(buf, 'rb') as igz:
         unc = igz.read()
         return unc

@@ -2,7 +2,7 @@
 '''
 Connection module for Telemetry
 
-... versionadded:: Boron.
+.. versionadded:: 2016.3.0
 
 https://github.com/mongolab/mongolab-telemetry-api-docs/blob/master/alerts.md
 
@@ -11,12 +11,14 @@ https://github.com/mongolab/mongolab-telemetry-api-docs/blob/master/alerts.md
 
     https://github.com/mongolab/mongolab-telemetry-api-docs/blob/master/alerts.md
 
-   in the minion's config file::
+    In the minion's config file:
 
-        telemetry.telemetry_api_keys:
-              - abc123  # Key 1
-              - efg321  # Backup Key 1
-        telemetry_api_base_url: https://telemetry-api.mongolab.com/v0
+    .. code-block:: yaml
+
+       telemetry.telemetry_api_keys:
+         - abc123  # Key 1
+         - efg321  # Backup Key 1
+       telemetry_api_base_url: https://telemetry-api.mongolab.com/v0
 
 :depends: requests
 
@@ -153,7 +155,7 @@ def get_alert_config(deployment_id, metric_name=None, api_key=None, profile="tel
 def get_notification_channel_id(notify_channel, profile="telemetry"):
     '''
     Given an email address, creates a notification-channels
-    if one is not found and also returns the corresponsing
+    if one is not found and also returns the corresponding
     notification channel id.
 
     notify_channel

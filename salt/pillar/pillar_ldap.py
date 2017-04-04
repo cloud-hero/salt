@@ -226,7 +226,6 @@ def _result_to_dict(data, result, conf, source):
                             data[skey] = [sval]
                         else:
                             data[skey].append(sval)
-    print('Returning data {0}'.format(data))
     return data
 
 
@@ -288,7 +287,7 @@ def ext_pillar(minion_id,  # pylint: disable=W0613
             import salt.log
             msg = 'Error parsing configuration file: {0} - {1}'
             if salt.log.is_console_configured():
-                log.warn(msg.format(config_file, err))
+                log.warning(msg.format(config_file, err))
             else:
                 print(msg.format(config_file, err))
     else:
@@ -298,7 +297,7 @@ def ext_pillar(minion_id,  # pylint: disable=W0613
     for source in opts['search_order']:
         config = opts[source]
         result = _do_search(config)
-        print('source {0} got result {1}'.format(source, result))
+        log.debug('source {0} got result {1}'.format(source, result))
         if result:
             data = _result_to_dict(data, result, config, source)
     return data

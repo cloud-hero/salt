@@ -18,14 +18,14 @@ all interfaces are ignored unless specified.
 .. code-block:: yaml
 
     system:
-        network.system:
-          - enabled: True
-          - hostname: server1.example.com
-          - gateway: 192.168.0.1
-          - gatewaydev: eth0
-          - nozeroconf: True
-          - nisdomain: example.com
-          - require_reboot: True
+      network.system:
+        - enabled: True
+        - hostname: server1.example.com
+        - gateway: 192.168.0.1
+        - gatewaydev: eth0
+        - nozeroconf: True
+        - nisdomain: example.com
+        - require_reboot: True
 
     eth0:
       network.managed:
@@ -203,20 +203,50 @@ all interfaces are ignored unless specified.
           - network: eth4
 
     system:
-        network.system:
-          - enabled: True
-          - hostname: server1.example.com
-          - gateway: 192.168.0.1
-          - gatewaydev: eth0
-          - nozeroconf: True
-          - nisdomain: example.com
-          - require_reboot: True
-          - apply_hostname: True
+      network.system:
+        - enabled: True
+        - hostname: server1.example.com
+        - gateway: 192.168.0.1
+        - gatewaydev: eth0
+        - nozeroconf: True
+        - nisdomain: example.com
+        - require_reboot: True
+        - apply_hostname: True
+
+    lo:
+      network.managed:
+        - name: lo
+        - type: eth
+        - onboot: yes
+        - userctl: no
+        - ipv6_autoconf: no
+        - enable_ipv6: true
+        - ipaddrs:
+          - 127.0.0.1/8
+          - 10.1.0.4/32
+          - 10.1.0.12/32
+        - ipv6addrs:
+          - fc00::1/128
+          - fc00::100/128
 
     .. note::
         Apply changes to hostname immediately.
 
     .. versionadded:: 2015.5.0
+
+    system:
+      network.system:
+        - hostname: server2.example.com
+        - apply_hostname: True
+        - retain_settings: True
+
+    .. note::
+        Use `retain_settings` to retain current network settings that are not
+        otherwise specified in the state. Particularly useful if only setting
+        the hostname. Default behavior is to delete unspecified network
+        settings.
+
+    .. versionadded:: 2016.11.0
 
 .. note::
 
@@ -379,7 +409,7 @@ def managed(name, type, enabled=True, **kwargs):
             for iface in interfaces:
                 if 'secondary' in interfaces[iface]:
                     for second in interfaces[iface]['secondary']:
-                        if second.get('label', '') == 'name':
+                        if second.get('label', '') == name:
                             interface_status = True
         if enabled:
             if 'noifupdown' not in kwargs:
@@ -389,7 +419,6 @@ def managed(name, type, enabled=True, **kwargs):
                         __salt__['ip.down'](name, type)
                         __salt__['ip.up'](name, type)
                         ret['changes']['status'] = 'Interface {0} restart to validate'.format(name)
-                        return ret
                 else:
                     __salt__['ip.up'](name, type)
                     ret['changes']['status'] = 'Interface {0} is up'.format(name)
@@ -401,6 +430,36 @@ def managed(name, type, enabled=True, **kwargs):
     except Exception as error:
         ret['result'] = False
         ret['comment'] = str(error)
+        return ret
+
+    # Try to enslave bonding interfaces after master was created
+    if type == 'bond' and 'noifupdown' not in kwargs:
+
+        if 'slaves' in kwargs and kwargs['slaves']:
+            # Check that there are new slaves for this master
+            present_slaves = __salt__['cmd.run'](
+                ['cat', '/sys/class/net/{0}/bonding/slaves'.format(name)]).split()
+            desired_slaves = kwargs['slaves'].split()
+            missing_slaves = set(desired_slaves) - set(present_slaves)
+
+            # Enslave only slaves missing in master
+            if missing_slaves:
+                ifenslave_path = __salt__['cmd.run'](['which', 'ifenslave']).strip()
+                if ifenslave_path:
+                    log.info("Adding slaves '{0}' to the master {1}".format(' '.join(missing_slaves), name))
+                    cmd = [ifenslave_path, name] + list(missing_slaves)
+                    __salt__['cmd.run'](cmd, python_shell=False)
+                else:
+                    log.error("Command 'ifenslave' not found")
+                ret['changes']['enslave'] = (
+                    "Added slaves '{0}' to master '{1}'"
+                    .format(' '.join(missing_slaves), name))
+            else:
+                log.info("All slaves '{0}' are already added to the master {1}"
+                         ", no actions required".format(' '.join(missing_slaves), name))
+
+    if enabled and interface_status:
+        # Interface was restarted, return
         return ret
 
     # TODO: create saltutil.refresh_grains that fires events to the minion daemon
@@ -517,6 +576,10 @@ def system(name, **kwargs):
             apply_net_settings = True
             ret['changes']['network_settings'] = '\n'.join(diff)
     except AttributeError as error:
+        ret['result'] = False
+        ret['comment'] = str(error)
+        return ret
+    except KeyError as error:
         ret['result'] = False
         ret['comment'] = str(error)
         return ret

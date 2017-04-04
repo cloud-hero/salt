@@ -3,6 +3,7 @@
 The core behaviors used by minion and master
 '''
 # pylint: disable=W0232
+# pylint: disable=3rd-party-module-not-gated
 
 # Import python libs
 from __future__ import absolute_import
@@ -12,6 +13,7 @@ import random
 import logging
 import itertools
 from collections import deque
+from _socket import gaierror
 
 # Import salt libs
 import salt.daemons.masterapi
@@ -19,21 +21,26 @@ import salt.utils.args
 import salt.utils.process
 import salt.transport
 import salt.engines
+
+# pylint: disable=import-error
 from raet import raeting
 from raet.road.stacking import RoadStack
 from raet.road.estating import RemoteEstate
 from raet.lane.stacking import LaneStack
+# pylint: enable=import-error
 
 from salt import daemons
 from salt.daemons import salting
+from salt.exceptions import SaltException
 from salt.utils import kinds, is_windows
 from salt.utils.event import tagify
 
 # Import ioflo libs
-from ioflo.aid.odicting import odict
+# pylint: disable=import-error
+from ioflo.aid.odicting import odict  # pylint: disable=E0611,F0401
 import ioflo.base.deeding
-
 from ioflo.base.consoling import getConsole
+# pylint: enable=import-error
 console = getConsole()
 
 # Import Third Party Libs
@@ -380,13 +387,21 @@ class SaltRaetRoadStackJoiner(ioflo.base.deeding.Deed):
             if refresh_all or refresh_masters:
                 stack.puid = stack.Uid  # reset puid so reuse same uid each time
 
+                ex = SaltException('Unable to connect to any master')
                 for master in self.ushers.value:
-                    mha = master['external']
-                    stack.addRemote(RemoteEstate(stack=stack,
-                                                 fuid=0,  # vacuous join
-                                                 sid=0,  # always 0 for join
-                                                 ha=mha,
-                                                 kind=kinds.applKinds.master))
+                    try:
+                        mha = master['external']
+                        stack.addRemote(RemoteEstate(stack=stack,
+                                                     fuid=0,  # vacuous join
+                                                     sid=0,  # always 0 for join
+                                                     ha=mha,
+                                                     kind=kinds.applKinds.master))
+                    except gaierror as ex:
+                        log.warning("Unable to connect to master {0}: {1}".format(mha, ex))
+                        if self.opts.value.get('master_type') != 'failover':
+                            raise ex
+                if not stack.remotes:
+                    raise ex
 
             for remote in list(stack.remotes.values()):
                 if remote.kind == kinds.applKinds.master:

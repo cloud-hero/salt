@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 '''
-Create virtualenv environments
+Create virtualenv environments.
+
+.. versionadded:: 0.17.0
 '''
-from __future__ import absolute_import
 
 # Import python libs
+from __future__ import absolute_import
 import glob
 import shutil
 import logging
@@ -12,6 +14,8 @@ import os
 
 # Import salt libs
 import salt.utils
+import salt.utils.files
+import salt.utils.verify
 from salt.exceptions import CommandExecutionError, SaltInvocationError
 from salt.ext.six import string_types
 
@@ -105,8 +109,19 @@ def create(path,
         .. deprecated:: 2014.1.0
             ``user`` should be used instead
 
-    use_vt
-        Use VT terminal emulation (see ouptut while installing)
+    use_vt : False
+        Use VT terminal emulation (see output while installing)
+
+        .. versionadded:: 2015.5.0
+
+    saltenv : 'base'
+        Specify a different environment. The default environment is ``base``.
+
+        .. versionadded:: 2014.1.0
+
+    .. note::
+        The ``runas`` argument is deprecated as of 2014.1.0. ``user`` should be
+        used instead.
 
     CLI Example:
 
@@ -116,8 +131,6 @@ def create(path,
     '''
     if venv_bin is None:
         venv_bin = __opts__.get('venv_bin') or __pillar__.get('venv_bin')
-    # raise CommandNotFoundError if venv_bin is missing
-    salt.utils.check_or_die(venv_bin)
 
     cmd = [venv_bin]
 
@@ -274,7 +287,7 @@ def create(path,
     # Install pip
     if pip and not os.path.exists(venv_pip):
         _ret = _install_script(
-            'https://raw.githubusercontent.com/pypa/pip/master/contrib/get-pip.py',
+            'https://bootstrap.pypa.io/get-pip.py',
             path, venv_python, user, saltenv=saltenv, use_vt=use_vt
         )
         # Let's update the return dictionary with the details from the pip
@@ -319,7 +332,7 @@ def get_distribution_path(venv, distribution):
     '''
     Return the path to a distribution installed inside a virtualenv
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     venv
         Path to the virtualenv.
@@ -351,12 +364,12 @@ def get_distribution_path(venv, distribution):
 
 
 def get_resource_path(venv,
-                      package_or_requirement=None,
-                      resource_name=None,
                       package=None,
                       resource=None):
     '''
     Return the path to a package resource installed inside a virtualenv
+
+    .. versionadded:: 2015.5.0
 
     venv
         Path to the virtualenv
@@ -364,31 +377,12 @@ def get_resource_path(venv,
     package
         Name of the package in which the resource resides
 
-        .. versionadded:: Boron
-
-    package_or_requirement
-        Name of the package in which the resource resides
-
-        .. deprecated:: Boron
-            Use ``package`` instead.
+        .. versionadded:: 2016.3.0
 
     resource
         Name of the resource of which the path is to be returned
 
-        .. versionadded:: Boron
-
-    resource_name
-        Name of the resource of which the path is to be returned
-
-        .. deprecated:: Boron
-
-
-    venv
-        Path to the virtualenv.
-    package_or_requirement
-        Name of the package where the resource resides in.
-    resource_name
-        Name of the resource of which the path is to be returned.
+        .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -396,31 +390,6 @@ def get_resource_path(venv,
 
         salt '*' virtualenv.get_resource_path /path/to/my/venv my_package my/resource.xml
     '''
-    if package_or_requirement is not None:
-        salt.utils.warn_until(
-            'Nitrogen',
-            'The \'package_or_requirement\' argument to '
-            'virtualenv.get_resource_path is deprecated. Please use '
-            '\'package\' instead.'
-        )
-        if package is not None:
-            raise CommandExecutionError(
-                'Only one of \'package\' and \'package_or_requirement\' is '
-                'permitted.'
-            )
-        package = package_or_requirement
-    if resource_name is not None:
-        salt.utils.warn_until(
-            'Nitrogen',
-            'The \'resource_name\' argument to virtualenv.get_resource_path '
-            'is deprecated. Please use \'resource\' instead.'
-        )
-        if resource is not None:
-            raise CommandExecutionError(
-                'Only one of \'resource\' and \'resource_name\' is permitted.'
-            )
-        resource = resource_name
-
     _verify_safe_py_code(package, resource)
     bin_path = _verify_virtualenv(venv)
 
@@ -440,12 +409,12 @@ def get_resource_path(venv,
 
 
 def get_resource_content(venv,
-                         package_or_requirement=None,
-                         resource_name=None,
                          package=None,
                          resource=None):
     '''
     Return the content of a package resource installed inside a virtualenv
+
+    .. versionadded:: 2015.5.0
 
     venv
         Path to the virtualenv
@@ -453,32 +422,12 @@ def get_resource_content(venv,
     package
         Name of the package in which the resource resides
 
-        .. versionadded:: Boron
-
-    package_or_requirement
-        Name of the package in which the resource resides
-
-        .. deprecated:: Boron
-            Use ``package`` instead.
+        .. versionadded:: 2016.3.0
 
     resource
         Name of the resource of which the content is to be returned
 
-        .. versionadded:: Boron
-
-    resource_name
-        Name of the resource of which the content is to be returned
-
-        .. deprecated:: Boron
-
-
-    venv
-        Path to the virtualenv.
-    package_or_requirement
-        Name of the package where the resource resides in.
-    resource_name
-        Name of the resource of which the content is to be returned.
-
+        .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -486,32 +435,6 @@ def get_resource_content(venv,
 
         salt '*' virtualenv.get_resource_content /path/to/my/venv my_package my/resource.xml
     '''
-    if package_or_requirement is not None:
-        salt.utils.warn_until(
-            'Nitrogen',
-            'The \'package_or_requirement\' argument to '
-            'virtualenv.get_resource_content is deprecated. Please use '
-            '\'package\' instead.'
-        )
-        if package is not None:
-            raise CommandExecutionError(
-                'Only one of \'package\' and \'package_or_requirement\' is '
-                'permitted.'
-            )
-        package = package_or_requirement
-    if resource_name is not None:
-        salt.utils.warn_until(
-            'Nitrogen',
-            'The \'resource_name\' argument to '
-            'virtualenv.get_resource_content is deprecated. Please use '
-            '\'resource\' instead.'
-        )
-        if resource is not None:
-            raise CommandExecutionError(
-                'Only one of \'resource\' and \'resource_name\' is permitted.'
-            )
-        resource = resource_name
-
     _verify_safe_py_code(package, resource)
     bin_path = _verify_virtualenv(venv)
 
@@ -532,7 +455,7 @@ def get_resource_content(venv,
 
 def _install_script(source, cwd, python, user, saltenv='base', use_vt=False):
     if not salt.utils.is_windows():
-        tmppath = salt.utils.mkstemp(dir=cwd)
+        tmppath = salt.utils.files.mkstemp(dir=cwd)
     else:
         tmppath = __salt__['cp.cache_file'](source, saltenv)
 

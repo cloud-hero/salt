@@ -33,9 +33,11 @@ except ImportError:
     import imp
     __generated_syspaths = imp.new_module('salt._syspaths')
     for key in ('ROOT_DIR', 'CONFIG_DIR', 'CACHE_DIR', 'SOCK_DIR',
-                'SRV_ROOT_DIR', 'BASE_FILE_ROOTS_DIR', 'BASE_PILLAR_ROOTS_DIR',
+                'SRV_ROOT_DIR', 'BASE_FILE_ROOTS_DIR',
+                'BASE_PILLAR_ROOTS_DIR', 'BASE_THORIUM_ROOTS_DIR',
                 'BASE_MASTER_ROOTS_DIR', 'LOGS_DIR', 'PIDFILE_DIR',
-                'SPM_FORMULA_PATH', 'SPM_PILLAR_PATH', 'SPM_REACTOR_PATH'):
+                'SPM_FORMULA_PATH', 'SPM_PILLAR_PATH', 'SPM_REACTOR_PATH',
+                'SHARE_DIR'):
         setattr(__generated_syspaths, key, None)
 
 
@@ -73,6 +75,19 @@ if CONFIG_DIR is None:
     else:
         CONFIG_DIR = os.path.join(ROOT_DIR, 'etc', 'salt')
 
+SHARE_DIR = __generated_syspaths.SHARE_DIR
+if SHARE_DIR is None:
+    if __PLATFORM.startswith('win'):
+        SHARE_DIR = os.path.join(ROOT_DIR, 'share')
+    elif 'freebsd' in __PLATFORM:
+        SHARE_DIR = os.path.join(ROOT_DIR, 'usr', 'local', 'share', 'salt')
+    elif 'netbsd' in __PLATFORM:
+        SHARE_DIR = os.path.join(ROOT_DIR, 'usr', 'share', 'salt')
+    elif 'sunos5' in __PLATFORM:
+        SHARE_DIR = os.path.join(ROOT_DIR, 'usr', 'share', 'salt')
+    else:
+        SHARE_DIR = os.path.join(ROOT_DIR, 'usr', 'share', 'salt')
+
 CACHE_DIR = __generated_syspaths.CACHE_DIR
 if CACHE_DIR is None:
     CACHE_DIR = os.path.join(ROOT_DIR, 'var', 'cache', 'salt')
@@ -92,6 +107,10 @@ if BASE_FILE_ROOTS_DIR is None:
 BASE_PILLAR_ROOTS_DIR = __generated_syspaths.BASE_PILLAR_ROOTS_DIR
 if BASE_PILLAR_ROOTS_DIR is None:
     BASE_PILLAR_ROOTS_DIR = os.path.join(SRV_ROOT_DIR, 'pillar')
+
+BASE_THORIUM_ROOTS_DIR = __generated_syspaths.BASE_THORIUM_ROOTS_DIR
+if BASE_THORIUM_ROOTS_DIR is None:
+    BASE_THORIUM_ROOTS_DIR = os.path.join(SRV_ROOT_DIR, 'thorium')
 
 BASE_MASTER_ROOTS_DIR = __generated_syspaths.BASE_MASTER_ROOTS_DIR
 if BASE_MASTER_ROOTS_DIR is None:
@@ -120,6 +139,7 @@ if SPM_REACTOR_PATH is None:
 
 __all__ = [
     'ROOT_DIR',
+    'SHARE_DIR',
     'CONFIG_DIR',
     'CACHE_DIR',
     'SOCK_DIR',
@@ -127,6 +147,7 @@ __all__ = [
     'BASE_FILE_ROOTS_DIR',
     'BASE_PILLAR_ROOTS_DIR',
     'BASE_MASTER_ROOTS_DIR',
+    'BASE_THORIUM_ROOTS_DIR',
     'LOGS_DIR',
     'PIDFILE_DIR',
     'INSTALL_DIR',

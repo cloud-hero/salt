@@ -2,10 +2,6 @@
 FreeBSD
 =======
 
-Salt was added to the FreeBSD ports tree Dec 26th, 2011 by Christer Edwards
-<christer.edwards@gmail.com>. It has been tested on FreeBSD 7.4, 8.2, 9.0,
-9.1, 10.0 and later releases.
-
 Installation
 ============
 
@@ -17,7 +13,7 @@ FreeBSD repo
 ============
 
 The FreeBSD pkgng repository is preconfigured on systems 10.x and above. No
-configuration is needed to pull from these repositories. 
+configuration is needed to pull from these repositories.
 
 .. code-block:: shell
 
@@ -31,18 +27,16 @@ SaltStack repo
 ==============
 
 SaltStack also hosts internal binary builds of the Salt package, available from
-http://repo.saltstack.org/freebsd/. To make use of this repository, add the
+https://repo.saltstack.com/freebsd/. To make use of this repository, add the
 following file to your system:
 
 **/usr/local/etc/pkg/repos/saltstack.conf:**
 
-.. code-block:: json 
+.. code-block:: json
 
     saltstack: {
-      url: "http://repo.saltstack.com/freebsd/${ABI}/",
-      mirror_type: "http",
+      url: "https://repo.saltstack.com/freebsd/${ABI}/",
       enabled: yes
-      priority: 10
     }
 
 You should now be able to install Salt from this new repository:
@@ -106,4 +100,4 @@ Start the Salt Minion as follows:
 
    service salt_minion start
 
-Now go to the :doc:`Configuring Salt</ref/configuration/index>` page.
+Now go to the :ref:`Configuring Salt<configuring-salt>` page.

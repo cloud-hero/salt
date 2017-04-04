@@ -35,39 +35,29 @@ import logging
 
 # Import third party libs
 HAS_LIBS = False
-HAS_SIX = False
 try:
     import requests
-    from six.moves.html_parser import HTMLParser
-    try:
-        import salt.ext.six as six
-        HAS_SIX = True
-    except ImportError:
-        # Salt version <= 2014.7.0
-        try:
-            import six
-        except ImportError:
-            pass
+    import salt.ext.six as six
+    from salt.ext.six.moves.html_parser import HTMLParser  # pylint: disable=E0611
     HAS_LIBS = True
+
+    class ASAMHTMLParser(HTMLParser):  # fix issue #30477
+        def __init__(self):
+            HTMLParser.__init__(self)
+            self.data = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag != "a":
+                return
+            for attr in attrs:
+                if attr[0] != "href":
+                    return
+                self.data.append(attr[1])
+
 except ImportError:
     pass
 
 log = logging.getLogger(__name__)
-
-
-class ASAMHTMLParser(HTMLParser):
-
-    def __init__(self):
-        HTMLParser.__init__(self)
-        self.data = []
-
-    def handle_starttag(self, tag, attrs):
-        if tag != "a":
-            return
-        for attr in attrs:
-            if attr[0] != "href":
-                return
-            self.data.append(attr[1])
 
 
 def __virtual__():
@@ -75,7 +65,7 @@ def __virtual__():
     Check for ASAM Fan-Out driver configuration in master config file
     or directory and load runner only if it is specified
     '''
-    if not HAS_LIBS or not HAS_SIX:
+    if not HAS_LIBS:
         return False
 
     if _get_asam_configuration() is False:

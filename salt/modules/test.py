@@ -37,7 +37,7 @@ def attr_call():
     '''
     Call grains.items via the attribute
 
-    CLI Example::
+    CLI Example:
 
     .. code-block:: bash
 
@@ -48,10 +48,10 @@ def attr_call():
 
 def module_report():
     '''
-    Return a dict containing all of the exeution modules with a report on
+    Return a dict containing all of the execution modules with a report on
     the overall availability via different references
 
-    CLI Example::
+    CLI Example:
 
     .. code-block:: bash
 
@@ -190,7 +190,7 @@ def versions_report():
     return '\n'.join(salt.version.versions_report())
 
 
-versions = versions_report
+versions = salt.utils.alias_function(versions_report, 'versions')
 
 
 def conf_test():
@@ -321,6 +321,8 @@ def fib(num):
         salt '*' test.fib 3
     '''
     num = int(num)
+    if num < 0:
+        raise ValueError('Negative number is not allowed!')
     start = time.time()
     if num < 2:
         return num, time.time() - start
@@ -541,7 +543,7 @@ def try_(module, return_try_exception=False, **kwargs):
     '''
     Try to run a module command. On an exception return None.
     If `return_try_exception` is set True return the exception.
-    This can be helpfull in templates where running a module might fail as expected.
+    This can be helpful in templates where running a module might fail as expected.
 
     CLI Example:
 
@@ -569,7 +571,7 @@ def assertion(assertion):
 
     .. code-block:: bash
 
-        salt '*' test.assert False
+        salt '*' test.assertion False
     '''
     assert assertion
 

@@ -31,7 +31,7 @@ def __virtual__():
     Only run on Linux systems
     '''
     if __grains__['kernel'] != 'Linux':
-        return False
+        return (False, 'The linux_sysctl execution module cannot be loaded: only available on Linux systems.')
     return __virtualname__
 
 
@@ -41,7 +41,12 @@ def _check_systemd_salt_config():
         sysctl_dir = os.path.split(conf)[0]
         if not os.path.exists(sysctl_dir):
             os.makedirs(sysctl_dir)
-        salt.utils.fopen(conf, 'w').close()
+        try:
+            with salt.utils.fopen(conf, 'w'):
+                pass
+        except (IOError, OSError):
+            msg = 'Could not create file: {0}'
+            raise CommandExecutionError(msg.format(conf))
     return conf
 
 
@@ -80,16 +85,17 @@ def show(config_file=False):
     ret = {}
     if config_file:
         try:
-            for line in salt.utils.fopen(config_file):
-                if not line.startswith('#') and '=' in line:
-                    # search if we have some '=' instead of ' = ' separators
-                    SPLIT = ' = '
-                    if SPLIT not in line:
-                        SPLIT = SPLIT.strip()
-                    key, value = line.split(SPLIT, 1)
-                    key = key.strip()
-                    value = value.lstrip()
-                    ret[key] = value
+            with salt.utils.fopen(config_file) as fp_:
+                for line in fp_:
+                    if not line.startswith('#') and '=' in line:
+                        # search if we have some '=' instead of ' = ' separators
+                        SPLIT = ' = '
+                        if SPLIT not in line:
+                            SPLIT = SPLIT.strip()
+                        key, value = line.split(SPLIT, 1)
+                        key = key.strip()
+                        value = value.lstrip()
+                        ret[key] = value
         except (OSError, IOError):
             log.error('Could not open sysctl file')
             return None
@@ -171,7 +177,6 @@ def persist(name, value, config=None):
     '''
     if config is None:
         config = default_config()
-    running = show()
     edited = False
     # If the sysctl.conf is not present, add it
     if not os.path.isfile(config):
@@ -223,11 +228,12 @@ def persist(name, value, config=None):
             # This is the line to edit
             if str(comps[1]) == str(value):
                 # It is correct in the config, check if it is correct in /proc
-                if name in running:
-                    if str(running[name]) != str(value):
-                        assign(name, value)
-                        return 'Updated'
-                return 'Already set'
+                if str(get(name)) != str(value):
+                    assign(name, value)
+                    return 'Updated'
+                else:
+                    return 'Already set'
+
             nlines.append('{0} = {1}\n'.format(name, value))
             edited = True
             continue

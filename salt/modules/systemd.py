@@ -1,18 +1,30 @@
 # -*- coding: utf-8 -*-
 '''
-Provide the service module for systemd
+Provides the service module for systemd
+
+.. versionadded:: 0.10.0
+
+.. important::
+    If you feel that Salt should be using this module to manage services on a
+    minion, and it is using a different module (or gives an error similar to
+    *'service.start' is not available*), see :ref:`here
+    <module-provider-override>`.
 '''
 # Import python libs
 from __future__ import absolute_import
+import copy
+import errno
+import glob
 import logging
 import os
 import re
-import glob
+import shlex
 
 # Import 3rd-party libs
-import salt.ext.six as six
+import salt.utils.itertools
 import salt.utils.systemd
-import salt.exceptions
+from salt.exceptions import CommandExecutionError
+from salt.ext import six
 
 log = logging.getLogger(__name__)
 
@@ -20,22 +32,31 @@ __func_alias__ = {
     'reload_': 'reload'
 }
 
+SYSTEM_CONFIG_PATHS = ('/lib/systemd/system', '/usr/lib/systemd/system')
 LOCAL_CONFIG_PATH = '/etc/systemd/system'
-LEGACY_INIT_SCRIPT_PATH = '/etc/init.d'
-VALID_UNIT_TYPES = ['service', 'socket', 'device', 'mount', 'automount',
-                    'swap', 'target', 'path', 'timer']
+INITSCRIPT_PATH = '/etc/init.d'
+VALID_UNIT_TYPES = ('service', 'socket', 'device', 'mount', 'automount',
+                    'swap', 'target', 'path', 'timer')
 
 # Define the module's virtual name
 __virtualname__ = 'service'
+
+# Disable check for string substitution
+# pylint: disable=E1321
 
 
 def __virtual__():
     '''
     Only work on systems that have been booted with systemd
     '''
-    if __grains__['kernel'] == 'Linux' and salt.utils.systemd.booted(__context__):
+    if __grains__['kernel'] == 'Linux' \
+            and salt.utils.systemd.booted(__context__):
         return __virtualname__
-    return False
+    return (
+        False,
+        'The systemd execution module failed to load: only available on Linux '
+        'systems which have been booted with systemd.'
+    )
 
 
 def _canonical_unit_name(name):
@@ -43,121 +64,72 @@ def _canonical_unit_name(name):
     Build a canonical unit name treating unit names without one
     of the valid suffixes as a service.
     '''
+    if not isinstance(name, six.string_types):
+        name = str(name)
     if any(name.endswith(suffix) for suffix in VALID_UNIT_TYPES):
         return name
-    return '{0}.service'.format(name)
+    return '%s.service' % name
 
 
-def _canonical_template_unit_name(name):
+def _check_available(name):
     '''
-    Build a canonical unit name for unit instances based on templates.
+    Returns boolean telling whether or not the named service is available
     '''
-    return re.sub(r'@.+?(\.|$)', r'@\1', name)
+    _status = _systemctl_status(name)
+    sd_version = salt.utils.systemd.version(__context__)
+    if sd_version is not None and sd_version >= 231:
+        # systemd 231 changed the output of "systemctl status" for unknown
+        # services, and also made it return an exit status of 4. If we are on
+        # a new enough version, check the retcode, otherwise fall back to
+        # parsing the "systemctl status" output.
+        # See: https://github.com/systemd/systemd/pull/3385
+        # Also: https://github.com/systemd/systemd/commit/3dced37
+        return 0 <= _status['retcode'] < 4
 
+    out = _status['stdout'].lower()
+    if 'could not be found' in out:
+        # Catch cases where the systemd version is < 231 but the return code
+        # and output changes have been backported (e.g. RHEL 7.3).
+        return False
 
-def _systemctl_cmd(action, name):
-    '''
-    Build a systemctl command line. Treat unit names without one
-    of the valid suffixes as a service.
-    '''
-    return 'systemctl -n 0 {0} {1}'.format(action, _canonical_unit_name(name))
-
-
-def _get_all_units():
-    '''
-    Get all units and their state. Units ending in .service
-    are normalized so that they can be referenced without a type suffix.
-    '''
-    rexp = re.compile(r'(?m)^(?P<name>.+)\.(?P<type>' +
-                      '|'.join(VALID_UNIT_TYPES) +
-                      r')\s+loaded\s+(?P<active>[^\s]+)')
-
-    out = __salt__['cmd.run_stdout'](
-        'systemctl --all --full --no-legend --no-pager list-units | col -b',
-        python_shell=True
-    )
-
-    ret = {}
-    for match in rexp.finditer(out):
-        name = match.group('name')
-        if match.group('type') != 'service':
-            name += '.' + match.group('type')
-        ret[name] = match.group('active')
+    for line in salt.utils.itertools.split(out, '\n'):
+        match = re.match(r'\s+loaded:\s+(\S+)', line)
+        if match:
+            ret = match.group(1) != 'not-found'
+            break
+    else:
+        raise CommandExecutionError(
+            'Failed to get information on unit \'%s\'' % name
+        )
     return ret
 
 
-def _get_all_unit_files():
+def _check_for_unit_changes(name):
     '''
-    Get all unit files and their state. Unit files ending in .service
-    are normalized so that they can be referenced without a type suffix.
+    Check for modified/updated unit files, and run a daemon-reload if any are
+    found.
     '''
-    rexp = re.compile(r'(?m)^(?P<name>.+)\.(?P<type>' +
-                      '|'.join(VALID_UNIT_TYPES) +
-                      r')\s+(?P<state>.+)$')
-
-    out = __salt__['cmd.run_stdout'](
-        'systemctl --full --no-legend --no-pager list-unit-files | col -b',
-        python_shell=True
-    )
-
-    ret = {}
-    for match in rexp.finditer(out):
-        name = match.group('name')
-        if match.group('type') != 'service':
-            name += '.' + match.group('type')
-        ret[name] = match.group('state')
-    return ret
+    contextkey = 'systemd._check_for_unit_changes.{0}'.format(name)
+    if contextkey not in __context__:
+        if _untracked_custom_unit_found(name) or _unit_file_changed(name):
+            systemctl_reload()
+        # Set context key to avoid repeating this check
+        __context__[contextkey] = True
 
 
-def _get_all_legacy_init_scripts():
+def _clear_context():
     '''
-    Get all old-fashioned init-style scripts. State is always inactive, because systemd would already show them
-    otherwise.
+    Remove context
     '''
-    ret = {}
-    if not os.path.isdir(LEGACY_INIT_SCRIPT_PATH):
-        return ret
-    for fn in os.listdir(LEGACY_INIT_SCRIPT_PATH):
-        if not os.path.isfile(os.path.join(LEGACY_INIT_SCRIPT_PATH, fn)) or fn.startswith('rc'):
+    # Using list() here because modifying a dictionary during iteration will
+    # raise a RuntimeError.
+    for key in list(__context__):
+        try:
+            if key.startswith('systemd._systemctl_status.') \
+                    or key in ('systemd.systemd_services',):
+                __context__.pop(key)
+        except AttributeError:
             continue
-        log.info('Legacy init script: "%s".', fn)
-        ret[fn] = 'inactive'
-    return ret
-
-
-def _untracked_custom_unit_found(name):
-    '''
-    If the passed service name is not in the output from get_all(), but a unit
-    file exist in /etc/systemd/system, return True. Otherwise, return False.
-    '''
-    unit_path = os.path.join('/etc/systemd/system',
-                             _canonical_unit_name(name))
-    return name not in get_all() and os.access(unit_path, os.R_OK)
-
-
-def _unit_file_changed(name):
-    '''
-    Returns True if systemctl reports that the unit file has changed, otherwise
-    returns False.
-    '''
-    return "'systemctl daemon-reload'" in \
-        __salt__['cmd.run'](_systemctl_cmd('status', name)).lower()
-
-
-def systemctl_reload():
-    '''
-    Reloads systemctl, an action needed whenever unit files are updated.
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' service.systemctl_reload
-    '''
-    retcode = __salt__['cmd.retcode']('systemctl --system daemon-reload')
-    if retcode != 0:
-        log.error('Problem performing systemctl daemon-reload')
-    return retcode == 0
 
 
 def _default_runlevel():
@@ -202,79 +174,239 @@ def _default_runlevel():
     return runlevel
 
 
-def _runlevel():
+def _get_systemd_services():
     '''
-    Return the current runlevel
+    Use os.listdir() to get all the unit files
     '''
-    if 'systemd._runlevel' in __context__:
-        return __context__['systemd._runlevel']
-    out = __salt__['cmd.run']('runlevel', python_shell=False)
+    contextkey = 'systemd.systemd_services'
+    if contextkey in __context__:
+        return __context__[contextkey]
+    ret = set()
+    for path in SYSTEM_CONFIG_PATHS + (LOCAL_CONFIG_PATH,):
+        # Make sure user has access to the path, and if the path is a link
+        # it's likely that another entry in SYSTEM_CONFIG_PATHS or LOCAL_CONFIG_PATH
+        # points to it, so we can ignore it.
+        if os.access(path, os.R_OK) and not os.path.islink(path):
+            for fullname in os.listdir(path):
+                try:
+                    unit_name, unit_type = fullname.rsplit('.', 1)
+                except ValueError:
+                    continue
+                if unit_type in VALID_UNIT_TYPES:
+                    ret.add(unit_name if unit_type == 'service' else fullname)
+    __context__[contextkey] = copy.deepcopy(ret)
+    return ret
+
+
+def _get_sysv_services():
+    '''
+    Use os.listdir() and os.access() to get all the initscripts
+    '''
     try:
-        ret = out.split()[1]
-    except IndexError:
-        # The runlevel is unknown, return the default
-        ret = _default_runlevel()
-    __context__['systemd._runlevel'] = ret
+        sysv_services = os.listdir(INITSCRIPT_PATH)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            pass
+        elif exc.errno == errno.EACCES:
+            log.error(
+                'Unable to check sysvinit scripts, permission denied to %s',
+                INITSCRIPT_PATH
+            )
+        else:
+            log.error(
+                'Error %d encountered trying to check sysvinit scripts: %s',
+                exc.errno,
+                exc.strerror
+            )
+        return []
+
+    systemd_services = _get_systemd_services()
+    ret = []
+    for sysv_service in sysv_services:
+        if os.access(os.path.join(INITSCRIPT_PATH, sysv_service), os.X_OK):
+            if sysv_service in systemd_services:
+                log.debug(
+                    'sysvinit script \'%s\' found, but systemd unit '
+                    '\'%s.service\' already exists',
+                    sysv_service, sysv_service
+                )
+                continue
+            ret.append(sysv_service)
     return ret
 
 
 def _get_service_exec():
     '''
-    Debian uses update-rc.d to manage System-V style services.
-    http://www.debian.org/doc/debian-policy/ch-opersys.html#s9.3.3
+    Returns the path to the sysv service manager (either update-rc.d or
+    chkconfig)
     '''
-    executable = 'update-rc.d'
-    salt.utils.check_or_die(executable)
-    return executable
+    contextkey = 'systemd._get_service_exec'
+    if contextkey not in __context__:
+        executables = ('update-rc.d', 'chkconfig')
+        for executable in executables:
+            service_exec = salt.utils.which(executable)
+            if service_exec is not None:
+                break
+        else:
+            raise CommandExecutionError(
+                'Unable to find sysv service manager (tried {0})'.format(
+                    ', '.join(executables)
+                )
+            )
+        __context__[contextkey] = service_exec
+    return __context__[contextkey]
 
 
-def _has_sysv_exec():
+def _runlevel():
     '''
     Return the current runlevel
     '''
-    if 'systemd._has_sysv_exec' not in __context__:
+    contextkey = 'systemd._runlevel'
+    if contextkey in __context__:
+        return __context__[contextkey]
+    out = __salt__['cmd.run']('runlevel', python_shell=False, ignore_retcode=True)
+    try:
+        ret = out.split()[1]
+    except IndexError:
+        # The runlevel is unknown, return the default
+        ret = _default_runlevel()
+    __context__[contextkey] = ret
+    return ret
+
+
+def _systemctl_cmd(action, name=None, systemd_scope=False, no_block=False):
+    '''
+    Build a systemctl command line. Treat unit names without one
+    of the valid suffixes as a service.
+    '''
+    ret = []
+    if systemd_scope \
+            and salt.utils.systemd.has_scope(__context__) \
+            and __salt__['config.get']('systemd.scope', True):
+        ret.extend(['systemd-run', '--scope'])
+    ret.append('systemctl')
+    if no_block:
+        ret.append('--no-block')
+    if isinstance(action, six.string_types):
+        action = shlex.split(action)
+    ret.extend(action)
+    if name is not None:
+        ret.append(_canonical_unit_name(name))
+    if 'status' in ret:
+        ret.extend(['-n', '0'])
+    return ret
+
+
+def _systemctl_status(name):
+    '''
+    Helper function which leverages __context__ to keep from running 'systemctl
+    status' more than once.
+    '''
+    contextkey = 'systemd._systemctl_status.%s' % name
+    if contextkey in __context__:
+        return __context__[contextkey]
+    __context__[contextkey] = __salt__['cmd.run_all'](
+        _systemctl_cmd('status', name),
+        python_shell=False,
+        redirect_stderr=True,
+        ignore_retcode=True
+    )
+    return __context__[contextkey]
+
+
+def _sysv_enabled(name):
+    '''
+    A System-V style service is assumed disabled if the "startup" symlink
+    (starts with "S") to its script is found in /etc/init.d in the current
+    runlevel.
+    '''
+    # Find exact match (disambiguate matches like "S01anacron" for cron)
+    for match in glob.glob('/etc/rc%s.d/S*%s' % (_runlevel(), name)):
+        if re.match(r'S\d{,2}%s' % name, os.path.basename(match)):
+            return True
+    return False
+
+
+def _untracked_custom_unit_found(name):
+    '''
+    If the passed service name is not available, but a unit file exist in
+    /etc/systemd/system, return True. Otherwise, return False.
+    '''
+    unit_path = os.path.join('/etc/systemd/system',
+                             _canonical_unit_name(name))
+    return os.access(unit_path, os.R_OK) and not _check_available(name)
+
+
+def _unit_file_changed(name):
+    '''
+    Returns True if systemctl reports that the unit file has changed, otherwise
+    returns False.
+    '''
+    return "'systemctl daemon-reload'" in _systemctl_status(name)['stdout'].lower()
+
+
+def systemctl_reload():
+    '''
+    .. versionadded:: 0.15.0
+
+    Reloads systemctl, an action needed whenever unit files are updated.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' service.systemctl_reload
+    '''
+    out = __salt__['cmd.run_all'](
+        _systemctl_cmd('--system daemon-reload'),
+        python_shell=False,
+        redirect_stderr=True
+    )
+    if out['retcode'] != 0:
+        raise CommandExecutionError(
+            'Problem performing systemctl daemon-reload: %s' % out['stdout']
+        )
+    _clear_context()
+    return True
+
+
+def get_running():
+    '''
+    Return a list of all running services, so far as systemd is concerned
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' service.get_running
+    '''
+    ret = set()
+    # Get running systemd units
+    out = __salt__['cmd.run'](
+        _systemctl_cmd('--full --no-legend --no-pager'),
+        python_shell=False,
+        ignore_retcode=True,
+    )
+    for line in salt.utils.itertools.split(out, '\n'):
         try:
-            __context__['systemd._has_sysv_exec'] = bool(_get_service_exec())
-        except(
-            salt.exceptions.CommandExecutionError,
-            salt.exceptions.CommandNotFoundError
-        ):
-            __context__['systemd._has_sysv_exec'] = False
-    return __context__['systemd._has_sysv_exec']
+            comps = line.strip().split()
+            fullname = comps[0]
+            if len(comps) > 3:
+                active_state = comps[3]
+        except ValueError as exc:
+            log.error(exc)
+            continue
+        else:
+            if active_state != 'running':
+                continue
+        try:
+            unit_name, unit_type = fullname.rsplit('.', 1)
+        except ValueError:
+            continue
+        if unit_type in VALID_UNIT_TYPES:
+            ret.add(unit_name if unit_type == 'service' else fullname)
 
-
-def _sysv_exists(name):
-    script = '/etc/init.d/{0}'.format(name)
-    return os.access(script, os.X_OK)
-
-
-def _service_is_sysv(name):
-    '''
-    A System-V style service will have a control script in
-    /etc/init.d.
-    Return True only if the service doesnt also provide a systemd unit file.
-    '''
-    return (_has_sysv_exec() and
-            name in _get_all_units() and
-            name not in _get_all_unit_files() and
-            _sysv_exists(name))
-
-
-def _sysv_is_disabled(name):
-    '''
-    A System-V style service is assumed disabled if there is no
-    start-up link (starts with "S") to its script in /etc/init.d in
-    the current runlevel.
-    '''
-    return not bool(glob.glob('/etc/rc{0}.d/S*{1}'.format(_runlevel(), name)))
-
-
-def _sysv_is_enabled(name):
-    '''
-    Assume that if a System-V style service is not disabled then it
-    must be enabled.
-    '''
-    return not _sysv_is_disabled(name)
+    return sorted(ret)
 
 
 def get_enabled():
@@ -287,21 +419,33 @@ def get_enabled():
 
         salt '*' service.get_enabled
     '''
-    ret = []
-    units = _get_all_unit_files()
-    services = _get_all_units()
-    for name, state in six.iteritems(units):
-        if state == 'enabled':
-            ret.append(name)
-    for name, state in six.iteritems(services):
-        if name in units:
+    ret = set()
+    # Get enabled systemd units. Can't use --state=enabled here because it's
+    # not present until systemd 216.
+    out = __salt__['cmd.run'](
+        _systemctl_cmd('--full --no-legend --no-pager list-unit-files'),
+        python_shell=False,
+        ignore_retcode=True,
+    )
+    for line in salt.utils.itertools.split(out, '\n'):
+        try:
+            fullname, unit_state = line.strip().split(None, 1)
+        except ValueError:
             continue
-        # performance; if the legacy initscript doesnt exists,
-        # dont contiue up with systemd query
-        if not _service_is_sysv(name):
+        else:
+            if unit_state != 'enabled':
+                continue
+        try:
+            unit_name, unit_type = fullname.rsplit('.', 1)
+        except ValueError:
             continue
-        if _sysv_is_enabled(name):
-            ret.append(name)
+        if unit_type in VALID_UNIT_TYPES:
+            ret.add(unit_name if unit_type == 'service' else fullname)
+
+    # Add in any sysvinit services that are enabled
+    ret.update(set(
+        [x for x in _get_sysv_services() if _sysv_enabled(x)]
+    ))
     return sorted(ret)
 
 
@@ -315,12 +459,72 @@ def get_disabled():
 
         salt '*' service.get_disabled
     '''
-    ret = []
-    known_services = _get_all_unit_files()
-    known_services.update(_get_all_legacy_init_scripts())
-    for name, state in six.iteritems(known_services):
-        if state == 'disabled':
-            ret.append(name)
+    ret = set()
+    # Get disabled systemd units. Can't use --state=disabled here because it's
+    # not present until systemd 216.
+    out = __salt__['cmd.run'](
+        _systemctl_cmd('--full --no-legend --no-pager list-unit-files'),
+        python_shell=False,
+        ignore_retcode=True,
+    )
+    for line in salt.utils.itertools.split(out, '\n'):
+        try:
+            fullname, unit_state = line.strip().split(None, 1)
+        except ValueError:
+            continue
+        else:
+            if unit_state != 'disabled':
+                continue
+        try:
+            unit_name, unit_type = fullname.rsplit('.', 1)
+        except ValueError:
+            continue
+        if unit_type in VALID_UNIT_TYPES:
+            ret.add(unit_name if unit_type == 'service' else fullname)
+
+    # Add in any sysvinit services that are disabled
+    ret.update(set(
+        [x for x in _get_sysv_services() if not _sysv_enabled(x)]
+    ))
+    return sorted(ret)
+
+
+def get_static():
+    '''
+    .. versionadded:: 2015.8.5
+
+    Return a list of all static services
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' service.get_static
+    '''
+    ret = set()
+    # Get static systemd units. Can't use --state=static here because it's
+    # not present until systemd 216.
+    out = __salt__['cmd.run'](
+        _systemctl_cmd('--full --no-legend --no-pager list-unit-files'),
+        python_shell=False,
+        ignore_retcode=True,
+    )
+    for line in salt.utils.itertools.split(out, '\n'):
+        try:
+            fullname, unit_state = line.strip().split(None, 1)
+        except ValueError:
+            continue
+        else:
+            if unit_state != 'static':
+                continue
+        try:
+            unit_name, unit_type = fullname.rsplit('.', 1)
+        except ValueError:
+            continue
+        if unit_type in VALID_UNIT_TYPES:
+            ret.add(unit_name if unit_type == 'service' else fullname)
+
+    # sysvinit services cannot be static
     return sorted(ret)
 
 
@@ -334,14 +538,17 @@ def get_all():
 
         salt '*' service.get_all
     '''
-    return sorted(set(list(_get_all_units().keys()) + list(_get_all_unit_files().keys())
-                      + list(_get_all_legacy_init_scripts().keys())))
+    ret = _get_systemd_services()
+    ret.update(set(_get_sysv_services()))
+    return sorted(ret)
 
 
 def available(name):
     '''
-    Check that the given service is available taking into account
-    template units.
+    .. versionadded:: 0.10.4
+
+    Check that the given service is available taking into account template
+    units.
 
     CLI Example:
 
@@ -349,24 +556,17 @@ def available(name):
 
         salt '*' service.available sshd
     '''
-    name = _canonical_template_unit_name(name)
-    if name.endswith('.service'):
-        name = name[:-8]  # len('.service') is 8
-    units = get_all()
-    if name in units:
-        return True
-    elif '@' in name:
-        templatename = name[:name.find('@') + 1]
-        return templatename in units
-    else:
-        return False
+    _check_for_unit_changes(name)
+    return _check_available(name)
 
 
 def missing(name):
     '''
-    The inverse of service.available.
-    Returns ``True`` if the specified service is not available, otherwise returns
-    ``False``.
+    .. versionadded:: 2014.1.0
+
+    The inverse of :py:func:`service.available
+    <salt.modules.systemd.available>`. Returns ``True`` if the specified
+    service is not available, otherwise returns ``False``.
 
     CLI Example:
 
@@ -377,58 +577,181 @@ def missing(name):
     return not available(name)
 
 
-def unmask(name):
+def unmask(name, runtime=False):
     '''
+    .. versionadded:: 2015.5.0
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands run by this function from the ``salt-minion`` daemon's
+        control group. This is done to avoid a race condition in cases where
+        the ``salt-minion`` service is restarted while a service is being
+        modified. If desired, usage of `systemd-run(1)`_ can be suppressed by
+        setting a :mod:`config option <salt.modules.config.get>` called
+        ``systemd.scope``, with a value of ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+
     Unmask the specified service with systemd
 
+    runtime : False
+        Set to ``True`` to unmask this service only until the next reboot
+
+        .. versionadded:: Nitrogen
+            In previous versions, this function would remove whichever mask was
+            identified by running ``systemctl is-enabled`` on the service.
+            However, since it is possible to both have both indefinite and
+            runtime masks on a service simultaneously, this function now
+            removes a runtime mask only when this argument is set to ``True``,
+            and otherwise removes an indefinite mask.
+
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' service.unmask <service name>
+        salt '*' service.unmask foo
+        salt '*' service.unmask foo runtime=True
     '''
-    if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-        systemctl_reload()
-    return not (__salt__['cmd.retcode'](_systemctl_cmd('unmask', name))
-                or __salt__['cmd.retcode'](_systemctl_cmd('unmask --runtime', name)))
+    _check_for_unit_changes(name)
+    if not masked(name, runtime):
+        log.debug('Service \'%s\' is not %smasked',
+                  name, 'runtime-' if runtime else '')
+        return True
+
+    cmd = 'unmask --runtime' if runtime else 'unmask'
+    out = __salt__['cmd.run_all'](_systemctl_cmd(cmd, name, systemd_scope=True),
+                                  python_shell=False,
+                                  redirect_stderr=True)
+
+    if out['retcode'] != 0:
+        raise CommandExecutionError('Failed to unmask service \'%s\'' % name)
+
+    return True
 
 
-def mask(name):
+def mask(name, runtime=False):
     '''
+    .. versionadded:: 2015.5.0
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands run by this function from the ``salt-minion`` daemon's
+        control group. This is done to avoid a race condition in cases where
+        the ``salt-minion`` service is restarted while a service is being
+        modified. If desired, usage of `systemd-run(1)`_ can be suppressed by
+        setting a :mod:`config option <salt.modules.config.get>` called
+        ``systemd.scope``, with a value of ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+
     Mask the specified service with systemd
 
+    runtime : False
+        Set to ``True`` to mask this service only until the next reboot
+
+        .. versionadded:: 2015.8.5
+
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' service.mask <service name>
+        salt '*' service.mask foo
+        salt '*' service.mask foo runtime=True
     '''
-    if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-        systemctl_reload()
-    return not __salt__['cmd.retcode'](_systemctl_cmd('mask', name))
+    _check_for_unit_changes(name)
+
+    cmd = 'mask --runtime' if runtime else 'mask'
+    out = __salt__['cmd.run_all'](_systemctl_cmd(cmd, name, systemd_scope=True),
+                                  python_shell=False,
+                                  redirect_stderr=True)
+
+    if out['retcode'] != 0:
+        raise CommandExecutionError(
+            'Failed to mask service \'%s\'' % name,
+            info=out['stdout']
+        )
+
+    return True
 
 
-def masked(name):
+def masked(name, runtime=False):
     '''
-    Return if the named service is masked.
-
     .. versionadded:: 2015.8.0
+    .. versionchanged:: 2015.8.5
+        The return data for this function has changed. If the service is
+        masked, the return value will now be the output of the ``systemctl
+        is-enabled`` command (so that a persistent mask can be distinguished
+        from a runtime mask). If the service is not masked, then ``False`` will
+        be returned.
+    .. versionchanged:: Nitrogen
+        This function now returns a boolean telling the user whether a mask
+        specified by the new ``runtime`` argument is set. If ``runtime`` is
+        ``False``, this function will return ``True`` if an indefinite mask is
+        set for the named service (otherwise ``False`` will be returned). If
+        ``runtime`` is ``False``, this function will return ``True`` if a
+        runtime mask is set, otherwise ``False``.
 
-    CLI Example:
+    Check whether or not a service is masked
+
+    runtime : False
+        Set to ``True`` to check for a runtime mask
+
+        .. versionadded:: Nitrogen
+            In previous versions, this function would simply return the output
+            of ``systemctl is-enabled`` when the service was found to be
+            masked. However, since it is possible to both have both indefinite
+            and runtime masks on a service simultaneously, this function now
+            only checks for runtime masks if this argument is set to ``True``.
+            Otherwise, it will check for an indefinite mask.
+
+    CLI Examples:
 
     .. code-block:: bash
 
-        salt '*' service.masked <service name>
+        salt '*' service.masked foo
+        salt '*' service.masked foo runtime=True
     '''
-    if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-        systemctl_reload()
-    out = __salt__['cmd.run_all'](_systemctl_cmd('is-enabled', name), ignore_retcode=True)
-    return out['retcode'] == 1 and 'masked' in out['stdout']
+    _check_for_unit_changes(name)
+    root_dir = '/run' if runtime else '/etc'
+    link_path = os.path.join(root_dir,
+                             'systemd',
+                             'system',
+                             _canonical_unit_name(name))
+    try:
+        return os.readlink(link_path) == '/dev/null'
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            log.trace(
+                'Path %s does not exist. This is normal if service \'%s\' is '
+                'not masked or does not exist.', link_path, name
+            )
+        elif exc.errno == errno.EINVAL:
+            log.error(
+                'Failed to check mask status for service %s. Path %s is a '
+                'file, not a symlink. This could be caused by changes in '
+                'systemd and is probably a bug in Salt. Please report this '
+                'to the developers.', name, link_path
+            )
+        return False
 
 
-def start(name):
+def start(name, no_block=False):
     '''
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands run by this function from the ``salt-minion`` daemon's
+        control group. This is done to avoid a race condition in cases where
+        the ``salt-minion`` service is restarted while a service is being
+        modified. If desired, usage of `systemd-run(1)`_ can be suppressed by
+        setting a :mod:`config option <salt.modules.config.get>` called
+        ``systemd.scope``, with a value of ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+
     Start the specified service with systemd
+
+    no_block : False
+        Set to ``True`` to start the service using ``--no-block``.
+
+        .. versionadded:: Nitrogen
 
     CLI Example:
 
@@ -436,15 +759,32 @@ def start(name):
 
         salt '*' service.start <service name>
     '''
-    if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-        systemctl_reload()
+    _check_for_unit_changes(name)
     unmask(name)
-    return not __salt__['cmd.retcode'](_systemctl_cmd('start', name))
+    return __salt__['cmd.retcode'](
+        _systemctl_cmd('start', name, systemd_scope=True, no_block=no_block),
+        python_shell=False) == 0
 
 
-def stop(name):
+def stop(name, no_block=False):
     '''
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands run by this function from the ``salt-minion`` daemon's
+        control group. This is done to avoid a race condition in cases where
+        the ``salt-minion`` service is restarted while a service is being
+        modified. If desired, usage of `systemd-run(1)`_ can be suppressed by
+        setting a :mod:`config option <salt.modules.config.get>` called
+        ``systemd.scope``, with a value of ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+
     Stop the specified service with systemd
+
+    no_block : False
+        Set to ``True`` to start the service using ``--no-block``.
+
+        .. versionadded:: Nitrogen
 
     CLI Example:
 
@@ -452,14 +792,31 @@ def stop(name):
 
         salt '*' service.stop <service name>
     '''
-    if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-        systemctl_reload()
-    return not __salt__['cmd.retcode'](_systemctl_cmd('stop', name))
+    _check_for_unit_changes(name)
+    return __salt__['cmd.retcode'](
+        _systemctl_cmd('stop', name, systemd_scope=True, no_block=no_block),
+        python_shell=False) == 0
 
 
-def restart(name):
+def restart(name, no_block=False):
     '''
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands run by this function from the ``salt-minion`` daemon's
+        control group. This is done to avoid a race condition in cases where
+        the ``salt-minion`` service is restarted while a service is being
+        modified. If desired, usage of `systemd-run(1)`_ can be suppressed by
+        setting a :mod:`config option <salt.modules.config.get>` called
+        ``systemd.scope``, with a value of ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+
     Restart the specified service with systemd
+
+    no_block : False
+        Set to ``True`` to start the service using ``--no-block``.
+
+        .. versionadded:: Nitrogen
 
     CLI Example:
 
@@ -467,15 +824,32 @@ def restart(name):
 
         salt '*' service.restart <service name>
     '''
-    if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-        systemctl_reload()
+    _check_for_unit_changes(name)
     unmask(name)
-    return not __salt__['cmd.retcode'](_systemctl_cmd('restart', name))
+    return __salt__['cmd.retcode'](
+        _systemctl_cmd('restart', name, systemd_scope=True, no_block=no_block),
+        python_shell=False) == 0
 
 
-def reload_(name):
+def reload_(name, no_block=False):
     '''
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands run by this function from the ``salt-minion`` daemon's
+        control group. This is done to avoid a race condition in cases where
+        the ``salt-minion`` service is restarted while a service is being
+        modified. If desired, usage of `systemd-run(1)`_ can be suppressed by
+        setting a :mod:`config option <salt.modules.config.get>` called
+        ``systemd.scope``, with a value of ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+
     Reload the specified service with systemd
+
+    no_block : False
+        Set to ``True`` to start the service using ``--no-block``.
+
+        .. versionadded:: Nitrogen
 
     CLI Example:
 
@@ -483,15 +857,34 @@ def reload_(name):
 
         salt '*' service.reload <service name>
     '''
-    if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-        systemctl_reload()
+    _check_for_unit_changes(name)
     unmask(name)
-    return not __salt__['cmd.retcode'](_systemctl_cmd('reload', name))
+    return __salt__['cmd.retcode'](
+        _systemctl_cmd('reload', name, systemd_scope=True, no_block=no_block),
+        python_shell=False) == 0
 
 
-def force_reload(name):
+def force_reload(name, no_block=True):
     '''
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands run by this function from the ``salt-minion`` daemon's
+        control group. This is done to avoid a race condition in cases where
+        the ``salt-minion`` service is restarted while a service is being
+        modified. If desired, usage of `systemd-run(1)`_ can be suppressed by
+        setting a :mod:`config option <salt.modules.config.get>` called
+        ``systemd.scope``, with a value of ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+
+    .. versionadded:: 0.12.0
+
     Force-reload the specified service with systemd
+
+    no_block : False
+        Set to ``True`` to start the service using ``--no-block``.
+
+        .. versionadded:: Nitrogen
 
     CLI Example:
 
@@ -499,18 +892,20 @@ def force_reload(name):
 
         salt '*' service.force_reload <service name>
     '''
-    if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-        systemctl_reload()
+    _check_for_unit_changes(name)
     unmask(name)
-    return not __salt__['cmd.retcode'](_systemctl_cmd('force-reload', name))
+    return __salt__['cmd.retcode'](
+        _systemctl_cmd('force-reload', name,
+                       systemd_scope=True, no_block=no_block),
+        python_shell=False) == 0
 
 
-# The unused sig argument is required to maintain consistency in the state
-# system
-def status(name, sig=None):
+# The unused sig argument is required to maintain consistency with the API
+# established by Salt's service management states.
+def status(name, sig=None):  # pylint: disable=unused-argument
     '''
-    Return the status for a service via systemd, returns a bool
-    whether the service is running.
+    Return the status for a service via systemd, returns ``True`` if the
+    service is running and ``False`` if it is not.
 
     CLI Example:
 
@@ -518,15 +913,33 @@ def status(name, sig=None):
 
         salt '*' service.status <service name>
     '''
-    if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-        systemctl_reload()
-    return not __salt__['cmd.retcode'](_systemctl_cmd('is-active', name),
-                                       ignore_retcode=True)
+    _check_for_unit_changes(name)
+    return __salt__['cmd.retcode'](_systemctl_cmd('is-active', name),
+                                   python_shell=False,
+                                   ignore_retcode=True) == 0
 
 
-def enable(name, **kwargs):
+# The unused kwargs argument is required to maintain consistency with the API
+# established by Salt's service management states.
+def enable(name, **kwargs):  # pylint: disable=unused-argument
     '''
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands run by this function from the ``salt-minion`` daemon's
+        control group. This is done to avoid a race condition in cases where
+        the ``salt-minion`` service is restarted while a service is being
+        modified. If desired, usage of `systemd-run(1)`_ can be suppressed by
+        setting a :mod:`config option <salt.modules.config.get>` called
+        ``systemd.scope``, with a value of ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+
     Enable the named service to start when the system boots
+
+    no_block : False
+        Set to ``True`` to start the service using ``--no-block``.
+
+        .. versionadded:: Nitrogen
 
     CLI Example:
 
@@ -534,19 +947,49 @@ def enable(name, **kwargs):
 
         salt '*' service.enable <service name>
     '''
-    if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-        systemctl_reload()
+    no_block = kwargs.pop('no_block', False)
+    _check_for_unit_changes(name)
     unmask(name)
-    if _service_is_sysv(name):
-        executable = _get_service_exec()
-        cmd = '{0} -f {1} defaults 99'.format(executable, name)
-        return not __salt__['cmd.retcode'](cmd, python_shell=False)
-    return not __salt__['cmd.retcode'](_systemctl_cmd('enable', name))
+    if name in _get_sysv_services():
+        cmd = []
+        if salt.utils.systemd.has_scope(__context__) \
+                and __salt__['config.get']('systemd.scope', True):
+            cmd.extend(['systemd-run', '--scope'])
+        service_exec = _get_service_exec()
+        if service_exec.endswith('/update-rc.d'):
+            cmd.extend([service_exec, '-f', name, 'defaults', '99'])
+        elif service_exec.endswith('/chkconfig'):
+            cmd.extend([service_exec, name, 'on'])
+        return __salt__['cmd.retcode'](cmd,
+                                       python_shell=False,
+                                       ignore_retcode=True) == 0
+    return __salt__['cmd.retcode'](
+        _systemctl_cmd('enable', name, systemd_scope=True, no_block=no_block),
+        python_shell=False,
+        ignore_retcode=True) == 0
 
 
-def disable(name, **kwargs):
+# The unused kwargs argument is required to maintain consistency with the API
+# established by Salt's service management states.
+def disable(name, **kwargs):  # pylint: disable=unused-argument
     '''
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands run by this function from the ``salt-minion`` daemon's
+        control group. This is done to avoid a race condition in cases where
+        the ``salt-minion`` service is restarted while a service is being
+        modified. If desired, usage of `systemd-run(1)`_ can be suppressed by
+        setting a :mod:`config option <salt.modules.config.get>` called
+        ``systemd.scope``, with a value of ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+
     Disable the named service to not start when the system boots
+
+    no_block : False
+        Set to ``True`` to start the service using ``--no-block``.
+
+        .. versionadded:: Nitrogen
 
     CLI Example:
 
@@ -554,38 +997,30 @@ def disable(name, **kwargs):
 
         salt '*' service.disable <service name>
     '''
-    if _untracked_custom_unit_found(name) or _unit_file_changed(name):
-        systemctl_reload()
-    if _service_is_sysv(name):
-        executable = _get_service_exec()
-        cmd = [executable, '-f', name, 'remove']
-        return not __salt__['cmd.retcode'](cmd, python_shell=False)
-    return not __salt__['cmd.retcode'](_systemctl_cmd('disable', name))
+    no_block = kwargs.pop('no_block', False)
+    _check_for_unit_changes(name)
+    if name in _get_sysv_services():
+        cmd = []
+        if salt.utils.systemd.has_scope(__context__) \
+                and __salt__['config.get']('systemd.scope', True):
+            cmd.extend(['systemd-run', '--scope'])
+        service_exec = _get_service_exec()
+        if service_exec.endswith('/update-rc.d'):
+            cmd.extend([service_exec, '-f', name, 'remove'])
+        elif service_exec.endswith('/chkconfig'):
+            cmd.extend([service_exec, name, 'off'])
+        return __salt__['cmd.retcode'](cmd,
+                                       python_shell=False,
+                                       ignore_retcode=True) == 0
+    return __salt__['cmd.retcode'](
+        _systemctl_cmd('disable', name, systemd_scope=True, no_block=no_block),
+        python_shell=False,
+        ignore_retcode=True) == 0
 
 
-def _templated_instance_enabled(name):
-    '''
-    Services instantiated based on templates can not be checked with
-    systemctl is-enabled. Presence of the actual symlinks is checked
-    as a fall-back.
-    '''
-    if '@' not in name:
-        return False
-    find_unit_by_name = 'find {0} -name {1} -type l -print -quit'
-    return len(__salt__['cmd.run'](
-        find_unit_by_name.format(LOCAL_CONFIG_PATH,
-                                 _canonical_unit_name(name))
-    ))
-
-
-def _enabled(name):
-    is_enabled = \
-        not __salt__['cmd.retcode'](_systemctl_cmd('is-enabled', name),
-                                    ignore_retcode=True)
-    return is_enabled or _templated_instance_enabled(name) or _sysv_is_enabled(name)
-
-
-def enabled(name, **kwargs):
+# The unused kwargs argument is required to maintain consistency with the API
+# established by Salt's service management states.
+def enabled(name, **kwargs):  # pylint: disable=unused-argument
     '''
     Return if the named service is enabled to start on boot
 
@@ -595,12 +1030,32 @@ def enabled(name, **kwargs):
 
         salt '*' service.enabled <service name>
     '''
-    return _enabled(name)
+    # Try 'systemctl is-enabled' first, then look for a symlink created by
+    # systemctl (older systemd releases did not support using is-enabled to
+    # check templated services), and lastly check for a sysvinit service.
+    if __salt__['cmd.retcode'](_systemctl_cmd('is-enabled', name),
+                               python_shell=False,
+                               ignore_retcode=True) == 0:
+        return True
+    elif '@' in name:
+        # On older systemd releases, templated services could not be checked
+        # with ``systemctl is-enabled``. As a fallback, look for the symlinks
+        # created by systemctl when enabling templated services.
+        cmd = ['find', LOCAL_CONFIG_PATH, '-name', name,
+               '-type', 'l', '-print', '-quit']
+        # If the find command returns any matches, there will be output and the
+        # string will be non-empty.
+        if bool(__salt__['cmd.run'](cmd, python_shell=False)):
+            return True
+    elif name in _get_sysv_services():
+        return _sysv_enabled(name)
+
+    return False
 
 
 def disabled(name):
     '''
-    Return if the named service is disabled to start on boot
+    Return if the named service is disabled from starting on boot
 
     CLI Example:
 
@@ -608,11 +1063,13 @@ def disabled(name):
 
         salt '*' service.disabled <service name>
     '''
-    return not _enabled(name) and not _sysv_is_enabled(name)
+    return not enabled(name)
 
 
 def show(name):
     '''
+    .. versionadded:: 2014.7.0
+
     Show properties of one or more units/jobs or the manager
 
     CLI Example:
@@ -620,7 +1077,9 @@ def show(name):
         salt '*' service.show <service name>
     '''
     ret = {}
-    for line in __salt__['cmd.run'](_systemctl_cmd('show', name)).splitlines():
+    out = __salt__['cmd.run'](_systemctl_cmd('show', name),
+                              python_shell=False)
+    for line in salt.utils.itertools.split(out, '\n'):
         comps = line.split('=')
         name = comps[0]
         value = '='.join(comps[1:])
@@ -640,17 +1099,18 @@ def show(name):
 
 def execs():
     '''
+    .. versionadded:: 2014.7.0
+
     Return a list of all files specified as ``ExecStart`` for all services.
 
     CLI Example:
 
         salt '*' service.execs
     '''
-    execs_ = {}
+    ret = {}
     for service in get_all():
         data = show(service)
         if 'ExecStart' not in data:
             continue
-        execs_[service] = data['ExecStart']['path']
-
-    return execs_
+        ret[service] = data['ExecStart']['path']
+    return ret

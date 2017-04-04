@@ -3,10 +3,10 @@
 MOD_DIRS='
 auth
 beacons
-cloud
+clouds
 engines
 executors
-fileserver
+file_server
 modules
 netapi
 output
@@ -18,6 +18,7 @@ returners
 roster
 runners
 sdb
+thorium
 serializers
 states
 tops
@@ -27,7 +28,7 @@ build_stubs() {
     [ $# -eq 0 ] && { printf 'Module names are required.' 1>&2; return 1; }
     local outdir
 
-    while [[ -n $1 ]]; do
+    while [ -n $1 ]; do
         outdir="ref/${1}/all"
 
         mkdir -p "$outdir"

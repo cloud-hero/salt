@@ -24,7 +24,7 @@ def __virtual__():
     '''
     if salt.utils.is_windows():
         return __virtualname__
-    return False
+    return (False, "Module win_firewall: module only works on Windows systems")
 
 
 def get_config():
@@ -105,7 +105,8 @@ def get_rule(name='all'):
     return ret
 
 
-def add_rule(name, localport, protocol='tcp', action='allow', dir='in'):
+def add_rule(name, localport, protocol='tcp', action='allow', dir='in',
+             remoteip='any'):
     '''
     .. versionadded:: 2015.5.0
 
@@ -116,13 +117,20 @@ def add_rule(name, localport, protocol='tcp', action='allow', dir='in'):
     .. code-block:: bash
 
         salt '*' firewall.add_rule 'test' '8080' 'tcp'
+        salt '*' firewall.add_rule 'test' '1' 'icmpv4'
+        salt '*' firewall.add_rule 'test_remote_ip' '8000' 'tcp' 'allow' 'in' '192.168.0.1'
+
     '''
     cmd = ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
            'name={0}'.format(name),
            'protocol={0}'.format(protocol),
            'dir={0}'.format(dir),
-           'localport={0}'.format(localport),
-           'action={0}'.format(action)]
+           'action={0}'.format(action),
+           'remoteip={0}'.format(remoteip)]
+
+    if 'icmpv4' not in protocol and 'icmpv6' not in protocol:
+        cmd.append('localport={0}'.format(localport))
+
     ret = __salt__['cmd.run'](cmd, python_shell=False)
     if isinstance(ret, six.string_types):
         return ret.strip() == 'Ok.'
@@ -131,7 +139,7 @@ def add_rule(name, localport, protocol='tcp', action='allow', dir='in'):
         return False
 
 
-def delete_rule(name, localport, protocol='tcp', dir='in'):
+def delete_rule(name, localport, protocol='tcp', dir='in', remoteip='any'):
     '''
     .. versionadded:: 2015.8.0
 
@@ -142,12 +150,17 @@ def delete_rule(name, localport, protocol='tcp', dir='in'):
     .. code-block:: bash
 
         salt '*' firewall.delete_rule 'test' '8080' 'tcp' 'in'
+        salt '*' firewall.delete_rule 'test_remote_ip' '8000' 'tcp' 'in' '192.168.0.1'
     '''
     cmd = ['netsh', 'advfirewall', 'firewall', 'delete', 'rule',
            'name={0}'.format(name),
            'protocol={0}'.format(protocol),
            'dir={0}'.format(dir),
-           'localport={0}'.format(localport)]
+           'remoteip={0}'.format(remoteip)]
+
+    if 'icmpv4' not in protocol and 'icmpv6' not in protocol:
+        cmd.append('localport={0}'.format(localport))
+
     ret = __salt__['cmd.run'](cmd, python_shell=False)
     if isinstance(ret, six.string_types):
         return ret.endswith('Ok.')

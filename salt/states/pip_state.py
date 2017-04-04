@@ -21,6 +21,7 @@ requisite to a pkg.installed state for the package which provides pip
 
 # Import python libs
 from __future__ import absolute_import
+import re
 import logging
 
 # Import salt libs
@@ -47,6 +48,12 @@ if HAS_PIP is True:
         del pip
         if 'pip' in sys.modules:
             del sys.modules['pip']
+
+    try:
+        from pip.exceptions import InstallationError
+    except ImportError:
+        InstallationError = ValueError
+
 # pylint: enable=import-error
 
 logger = logging.getLogger(__name__)
@@ -103,9 +110,9 @@ def _check_pkg_version_format(pkg):
 
     if not HAS_PIP:
         ret['comment'] = (
-            'An importable pip module is required but could not be found on '
-            'your system. This usually means that the system''s pip package '
-            'is not installed properly.'
+            'An importable Python 2 pip module is required but could not be '
+            'found on your system. This usually means that the system\'s pip '
+            'package is not installed properly.'
         )
 
         return ret
@@ -135,7 +142,7 @@ def _check_pkg_version_format(pkg):
                         break
             else:
                 install_req = pip.req.InstallRequirement.from_line(pkg)
-    except ValueError as exc:
+    except (ValueError, InstallationError) as exc:
         ret['result'] = False
         if not from_vcs and '=' in pkg and '==' not in pkg:
             ret['comment'] = (
@@ -144,7 +151,7 @@ def _check_pkg_version_format(pkg):
             )
             return ret
         ret['comment'] = (
-            'pip raised an exception while parsing {0!r}: {1}'.format(
+            'pip raised an exception while parsing \'{0}\': {1}'.format(
                 pkg, exc
             )
         )
@@ -158,8 +165,16 @@ def _check_pkg_version_format(pkg):
         ret['version_spec'] = []
     else:
         ret['result'] = True
-        ret['prefix'] = install_req.req.project_name
-        ret['version_spec'] = install_req.req.specs
+        try:
+            ret['prefix'] = install_req.req.project_name
+            ret['version_spec'] = install_req.req.specs
+        except Exception:
+            ret['prefix'] = re.sub('[^A-Za-z0-9.]+', '-', install_req.name)
+            if hasattr(install_req, "specifier"):
+                specifier = install_req.specifier
+            else:
+                specifier = install_req.req.specifier
+            ret['version_spec'] = [(spec.operator, spec.version) for spec in specifier]
 
     return ret
 
@@ -173,15 +188,14 @@ def _check_if_installed(prefix, state_pkg_name, version_spec,
     # result: False means the package is not installed
     ret = {'result': False, 'comment': None}
 
-    # Check if the requested packated is already installed.
+    # Check if the requested package is already installed.
     try:
         pip_list = __salt__['pip.list'](prefix, bin_env=bin_env,
                                         user=user, cwd=cwd)
         prefix_realname = _find_key(prefix, pip_list)
     except (CommandNotFoundError, CommandExecutionError) as err:
         ret['result'] = None
-        ret['comment'] = 'Error installing {0!r}: {1}'.format(state_pkg_name,
-                                                              err)
+        ret['comment'] = 'Error installing \'{0}\': {1}'.format(state_pkg_name, err)
         return ret
 
     # If the package was already installed, check
@@ -206,7 +220,6 @@ def installed(name,
               pkgs=None,
               pip_bin=None,
               requirements=None,
-              env=None,
               bin_env=None,
               use_wheel=False,
               no_use_wheel=False,
@@ -237,7 +250,6 @@ def installed(name,
               user=None,
               no_chown=False,
               cwd=None,
-              activate=False,
               pre_releases=False,
               cert=None,
               allow_all_external=False,
@@ -246,15 +258,11 @@ def installed(name,
               process_dependency_links=False,
               env_vars=None,
               use_vt=False,
-              trusted_host=None):
+              trusted_host=None,
+              no_cache_dir=False,
+              cache_dir=None):
     '''
     Make sure the package is installed
-
-    .. note::
-
-        There is a known issue when using pip v1.0 that causes ``pip install`` to return
-        1 when executed without arguments. See :issue:`21845` for details and
-        potential workarounds.
 
     name
         The name of the python package to install. You can also specify version
@@ -359,16 +367,11 @@ def installed(name,
         When user is given, do not attempt to copy and chown
         a requirements file
 
+    no_cache_dir:
+        Disable the cache.
+
     cwd
         Current working directory to run pip from
-
-    activate
-        Activates the virtual environment, if given via bin_env,
-        before running install.
-
-        .. deprecated:: 2014.7.2
-            If `bin_env` is given, pip will already be sourced from that
-            virualenv, making `activate` effectively a noop.
 
     pre_releases
         Include pre-releases in the available versions
@@ -410,7 +413,7 @@ def installed(name,
                     VERBOSE: True
 
     use_vt
-        Use VT terminal emulation (see ouptut while installing)
+        Use VT terminal emulation (see output while installing)
 
     trusted_host
         Mark this host as trusted, even though it does not have valid or any
@@ -445,9 +448,6 @@ def installed(name,
         The following arguments are deprecated, do not use.
 
     pip_bin : None
-        Deprecated, use ``bin_env``
-
-    env : None
         Deprecated, use ``bin_env``
 
     .. versionchanged:: 0.17.0
@@ -512,8 +512,6 @@ def installed(name,
 
     if pip_bin and not bin_env:
         bin_env = pip_bin
-    elif env and not bin_env:
-        bin_env = env
 
     # If pkgs is present, ignore name
     if pkgs:
@@ -564,8 +562,8 @@ def installed(name,
     if repo is not None:
         msg = ('The \'repo\' argument to pip.installed is deprecated and will '
                'be removed in Salt {version}. Please use \'name\' instead. '
-               'The current value for name, {0!r} will be replaced by the '
-               'value of repo, {1!r}'.format(
+               'The current value for name, \'{0}\' will be replaced by the '
+               'value of repo, \'{1}\''.format(
                    name,
                    repo,
                    version=_SaltStackVersion.from_name('Lithium').formatted_version
@@ -597,7 +595,6 @@ def installed(name,
     target_pkgs = []
     already_installed_comments = []
     if requirements or editable:
-        name = ''
         comments = []
         # Append comments if this is a dry run.
         if __opts__['test']:
@@ -605,7 +602,7 @@ def installed(name,
             if requirements:
                 # TODO: Check requirements file against currently-installed
                 # packages to provide more accurate state output.
-                comments.append('Requirements file {0!r} will be '
+                comments.append('Requirements file \'{0}\' will be '
                                 'processed.'.format(requirements))
             if editable:
                 comments.append(
@@ -626,6 +623,12 @@ def installed(name,
                 out = _check_if_installed(prefix, state_pkg_name, version_spec,
                                           ignore_installed, force_reinstall,
                                           upgrade, user, cwd, bin_env)
+                # If _check_if_installed result is None, something went wrong with
+                # the command running. This way we keep stateful output.
+                if out['result'] is None:
+                    ret['result'] = False
+                    ret['comment'] = out['comment']
+                    return ret
             else:
                 out = {'result': False, 'comment': None}
 
@@ -692,7 +695,6 @@ def installed(name,
         user=user,
         no_chown=no_chown,
         cwd=cwd,
-        activate=activate,
         pre_releases=pre_releases,
         cert=cert,
         allow_all_external=allow_all_external,
@@ -702,18 +704,34 @@ def installed(name,
         saltenv=__env__,
         env_vars=env_vars,
         use_vt=use_vt,
-        trusted_host=trusted_host
+        trusted_host=trusted_host,
+        no_cache_dir=no_cache_dir
     )
 
-    if pip_install_call and (pip_install_call.get('retcode', 1) == 0):
+    # Check the retcode for success, but don't fail if using pip1 and the package is
+    # already present. Pip1 returns a retcode of 1 (instead of 0 for pip2) if you run
+    # "pip install" without any arguments. See issue #21845.
+    if pip_install_call and \
+            (pip_install_call.get('retcode', 1) == 0 or pip_install_call.get('stdout', '').startswith(
+                'You must give at least one requirement to install')):
         ret['result'] = True
 
         if requirements or editable:
             comments = []
             if requirements:
+                PIP_REQUIREMENTS_NOCHANGE = [
+                    'Requirement already satisfied',
+                    'Collecting',
+                    'Cloning',
+                    'Cleaning up...',
+                ]
                 for line in pip_install_call.get('stdout', '').split('\n'):
-                    if not line.startswith('Requirement already satisfied') \
-                            and line != 'Cleaning up...':
+                    if not any(
+                        [
+                            line.strip().startswith(x)
+                            for x in PIP_REQUIREMENTS_NOCHANGE
+                        ]
+                    ):
                         ret['changes']['requirements'] = True
                 if ret['changes'].get('requirements'):
                     comments.append('Successfully processed requirements file '
@@ -732,6 +750,14 @@ def installed(name,
             # Create comments reporting success and failures
             pkg_404_comms = []
 
+            already_installed_packages = set()
+            for line in pip_install_call.get('stdout', '').split('\n'):
+                # Output for already installed packages:
+                # 'Requirement already up-to-date: jinja2 in /usr/local/lib/python2.7/dist-packages\nCleaning up...'
+                if line.startswith('Requirement already up-to-date: '):
+                    package = line.split(':', 1)[1].split()[0]
+                    already_installed_packages.add(package.lower())
+
             for prefix, state_name in target_pkgs:
 
                 # Case for packages that are not an URL
@@ -749,6 +775,8 @@ def installed(name,
                         )
                     else:
                         pkg_name = _find_key(prefix, pipsearch)
+                        if pkg_name.lower() in already_installed_packages:
+                            continue
                         ver = pipsearch[pkg_name]
                         ret['changes']['{0}=={1}'.format(pkg_name,
                                                          ver)] = 'Installed'
@@ -814,7 +842,7 @@ def removed(name,
     bin_env : None
         the pip executable or virtualenenv to use
     use_vt
-        Use VT terminal emulation (see ouptut while installing)
+        Use VT terminal emulation (see output while installing)
     '''
     ret = {'name': name, 'result': None, 'comment': '', 'changes': {}}
 
@@ -871,7 +899,7 @@ def uptodate(name,
     bin_env
         the pip executable or virtualenenv to use
     use_vt
-        Use VT terminal emulation (see ouptut while installing)
+        Use VT terminal emulation (see output while installing)
     '''
     ret = {'name': name,
            'changes': {},

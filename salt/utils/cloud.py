@@ -5,6 +5,7 @@ Utility functions for salt.cloud
 
 # Import python libs
 from __future__ import absolute_import
+import errno
 import os
 import sys
 import stat
@@ -56,7 +57,6 @@ import salt.client
 import salt.config
 import salt.utils
 import salt.utils.event
-from salt import syspaths
 from salt.utils import vt
 from salt.utils.nb_popen import NonBlockingPopen
 from salt.utils.yamldumper import SafeOrderedDumper
@@ -214,13 +214,13 @@ def minion_config(opts, vm_):
     Return a minion's configuration for the provided options and VM
     '''
 
-    # Let's get a copy of the salt minion default options
-    minion = copy.deepcopy(salt.config.DEFAULT_MINION_OPTS)
-    # Some default options are Null, let's set a reasonable default
-    minion.update(
-        log_level='info',
-        log_level_logfile='info'
-    )
+    # Don't start with a copy of the default minion opts; they're not always
+    # what we need. Some default options are Null, let's set a reasonable default
+    minion = {
+        'master': 'salt',
+        'log_level': 'info',
+        'hash_type': 'sha256',
+    }
 
     # Now, let's update it to our needs
     minion['id'] = vm_['name']
@@ -264,7 +264,8 @@ def master_config(opts, vm_):
     # Some default options are Null, let's set a reasonable default
     master.update(
         log_level='info',
-        log_level_logfile='info'
+        log_level_logfile='info',
+        hash_type='sha256'
     )
 
     # Get ANY defined master setting, merging data, in the following order
@@ -493,6 +494,12 @@ def bootstrap(vm_, opts):
         deploy_kwargs['use_winrm'] = salt.config.get_cloud_config_value(
             'use_winrm', vm_, opts, default=False
         )
+        deploy_kwargs['winrm_port'] = salt.config.get_cloud_config_value(
+            'winrm_port', vm_, opts, default=5986
+        )
+        deploy_kwargs['winrm_use_ssl'] = salt.config.get_cloud_config_value(
+        'winrm_use_ssl', vm_, opts, default=True
+        )
 
     # Store what was used to the deploy the VM
     event_kwargs = copy.deepcopy(deploy_kwargs)
@@ -508,7 +515,10 @@ def bootstrap(vm_, opts):
         'event',
         'executing deploy script',
         'salt/cloud/{0}/deploying'.format(vm_['name']),
-        {'kwargs': event_kwargs},
+        args={'kwargs': event_kwargs},
+        sock_dir=opts.get(
+            'sock_dir',
+            os.path.join(__opts__['sock_dir'], 'master')),
         transport=opts.get('transport', 'zeromq')
     )
 
@@ -615,6 +625,7 @@ def wait_for_port(host, port=22, timeout=900, gateway=None):
     # we first want to test the gateway before the host.
     test_ssh_host = host
     test_ssh_port = port
+
     if gateway:
         ssh_gateway = gateway['ssh_gateway']
         ssh_gateway_port = 22
@@ -640,8 +651,14 @@ def wait_for_port(host, port=22, timeout=900, gateway=None):
     while True:
         trycount += 1
         try:
+            if socket.inet_pton(socket.AF_INET6, host):
+                sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            else:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        except socket.error:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(30)
+        try:
+            sock.settimeout(5)
             sock.connect((test_ssh_host, int(test_ssh_port)))
             # Stop any remaining reads/writes on the socket
             sock.shutdown(socket.SHUT_RDWR)
@@ -807,7 +824,7 @@ def wait_for_winexesvc(host, port, username, password, timeout=900):
             )
 
 
-def wait_for_winrm(host, port, username, password, timeout=900):
+def wait_for_winrm(host, port, username, password, timeout=900, use_ssl=True):
     '''
     Wait until WinRM connection can be established.
     '''
@@ -821,8 +838,12 @@ def wait_for_winrm(host, port, username, password, timeout=900):
     while True:
         trycount += 1
         try:
-            s = winrm.Session(host, auth=(username, password), transport='ssl')
-            s.protocol.set_timeout(15)
+            transport = 'ssl'
+            if not use_ssl:
+                transport = 'plaintext'
+            s = winrm.Session(host, auth=(username, password), transport=transport)
+            if hasattr(s.protocol, 'set_timeout'):
+                s.protocol.set_timeout(15)
             log.trace('WinRM endpoint url: {0}'.format(s.url))
             r = s.run_cmd('sc query winrm')
             if r.status_code == 0:
@@ -841,6 +862,7 @@ def wait_for_winrm(host, port, username, password, timeout=900):
                     host, port, trycount
                 )
             )
+            time.sleep(1)
 
 
 def validate_windows_cred(host,
@@ -965,6 +987,8 @@ def deploy_windows(host,
                    opts=None,
                    master_sign_pub_file=None,
                    use_winrm=False,
+                   winrm_port=5986,
+                   winrm_use_ssl=True,
                    **kwargs):
     '''
     Copy the install files to a remote Windows box, and execute them
@@ -989,9 +1013,9 @@ def deploy_windows(host,
     winrm_session = None
 
     if HAS_WINRM and use_winrm:
-        winrm_session = wait_for_winrm(host=host, port=5986,
-                                           username=username, password=password,
-                                           timeout=port_timeout * 60)
+        winrm_session = wait_for_winrm(host=host, port=winrm_port,
+                                       username=username, password=password,
+                                       timeout=port_timeout * 60, use_ssl=winrm_use_ssl)
         if winrm_session is not None:
             service_available = True
     else:
@@ -1110,8 +1134,11 @@ def deploy_windows(host,
         # Delete C:\salttmp\ and installer file
         # Unless keep_tmp is True
         if not keep_tmp:
-            smb_conn.deleteFile('C$', 'salttemp/{0}'.format(installer))
-            smb_conn.deleteDirectory('C$', 'salttemp')
+            if use_winrm:
+                winrm_cmd(winrm_session, 'rmdir', ['/Q', '/S', 'C:\\salttemp\\'])
+            else:
+                smb_conn.deleteFile('C$', 'salttemp/{0}'.format(installer))
+                smb_conn.deleteDirectory('C$', 'salttemp')
         # Shell out to winexe to ensure salt-minion service started
         if use_winrm:
             winrm_cmd(winrm_session, 'sc', ['stop', 'salt-minion'])
@@ -1139,7 +1166,10 @@ def deploy_windows(host,
             'event',
             '{0} has been deployed at {1}'.format(name, host),
             'salt/cloud/{0}/deploy_windows'.format(name),
-            {'name': name},
+            args={'name': name},
+            sock_dir=opts.get(
+                'sock_dir',
+                os.path.join(__opts__['sock_dir'], 'master')),
             transport=opts.get('transport', 'zeromq')
         )
 
@@ -1245,8 +1275,7 @@ def deploy_script(host,
 
             if root_cmd('test -e \'{0}\''.format(tmp_dir), tty, sudo,
                         allow_failure=True, **ssh_kwargs):
-                ret = root_cmd(('sh -c "( mkdir -p \'{0}\' &&'
-                                ' chmod 700 \'{0}\' )"').format(tmp_dir),
+                ret = root_cmd(('sh -c "( mkdir -p -m 700 \'{0}\' )"').format(tmp_dir),
                                tty, sudo, **ssh_kwargs)
                 if ret:
                     raise SaltCloudSystemExit(
@@ -1255,15 +1284,16 @@ def deploy_script(host,
                     )
             if sudo:
                 comps = tmp_dir.lstrip('/').rstrip('/').split('/')
-                if comps and comps[0] != 'tmp':
-                    ret = root_cmd(
-                        'chown {0} \'{1}\''.format(username, tmp_dir),
-                        tty, sudo, **ssh_kwargs
-                    )
-                    if ret:
-                        raise SaltCloudSystemExit(
-                            'Cant set {0} ownership on {1}'.format(
-                                username, tmp_dir))
+                if len(comps) > 0:
+                    if len(comps) > 1 or comps[0] != 'tmp':
+                        ret = root_cmd(
+                            'chown {0} "{1}"'.format(username, tmp_dir),
+                            tty, sudo, **ssh_kwargs
+                        )
+                        if ret:
+                            raise SaltCloudSystemExit(
+                                'Cant set {0} ownership on {1}'.format(
+                                    username, tmp_dir))
 
             if not isinstance(file_map, dict):
                 file_map = {}
@@ -1314,7 +1344,7 @@ def deploy_script(host,
                                tty, sudo, **ssh_kwargs)
                 if ret:
                     raise SaltCloudSystemExit(
-                        'Cant set perms on {0}/minion.pem'.format(tmp_dir))
+                        'Can\'t set perms on {0}/minion.pem'.format(tmp_dir))
             if minion_pub:
                 ssh_file(opts, '{0}/minion.pub'.format(tmp_dir), minion_pub, ssh_kwargs)
 
@@ -1392,7 +1422,7 @@ def deploy_script(host,
                 )
                 if ret:
                     raise SaltCloudSystemExit(
-                        'Cant set perms on {0}'.format(
+                        'Can\'t set perms on {0}'.format(
                             preseed_minion_keys_tempdir))
                 if ssh_kwargs['username'] != 'root':
                     root_cmd(
@@ -1418,7 +1448,7 @@ def deploy_script(host,
                     )
                     if ret:
                         raise SaltCloudSystemExit(
-                            'Cant set owneship for {0}'.format(
+                            'Can\'t set ownership for {0}'.format(
                                 preseed_minion_keys_tempdir))
 
             # The actual deploy script
@@ -1432,7 +1462,7 @@ def deploy_script(host,
                     tty, sudo, **ssh_kwargs)
                 if ret:
                     raise SaltCloudSystemExit(
-                        'Cant set perms on {0}/deploy.sh'.format(tmp_dir))
+                        'Can\'t set perms on {0}/deploy.sh'.format(tmp_dir))
 
             newtimeout = timeout - (time.mktime(time.localtime()) - starttime)
             queue = None
@@ -1607,10 +1637,13 @@ def deploy_script(host,
                 'event',
                 '{0} has been deployed at {1}'.format(name, host),
                 'salt/cloud/{0}/deploy_script'.format(name),
-                {
+                args={
                     'name': name,
                     'host': host
                 },
+                sock_dir=opts.get(
+                    'sock_dir',
+                    os.path.join(__opts__['sock_dir'], 'master')),
                 transport=opts.get('transport', 'zeromq')
             )
             if file_map_fail or file_map_success:
@@ -1703,15 +1736,51 @@ def run_inline_script(host,
     return True
 
 
+def filter_event(tag, data, defaults):
+    '''
+    Accept a tag, a dict and a list of default keys to return from the dict, and
+    check them against the cloud configuration for that tag
+    '''
+    ret = {}
+    keys = []
+    use_defaults = True
+
+    for ktag in __opts__.get('filter_events', {}):
+        if tag != ktag:
+            continue
+        keys = __opts__['filter_events'][ktag]['keys']
+        use_defaults = __opts__['filter_events'][ktag].get('use_defaults', True)
+
+    if use_defaults is False:
+        defaults = []
+
+    defaults = list(set(defaults + keys))
+
+    for key in defaults:
+        if key in data:
+            ret[key] = data[key]
+
+    return ret
+
+
 def fire_event(key, msg, tag, args=None, sock_dir=None, transport='zeromq'):
-    # Fire deploy action
+    '''
+    Fire deploy action
+    '''
     if sock_dir is None:
-        sock_dir = os.path.join(syspaths.SOCK_DIR, 'master')
+        salt.utils.warn_until(
+            'Oxygen',
+            '`salt.utils.cloud.fire_event` requires that the `sock_dir`'
+            'parameter be passed in when calling the function.'
+        )
+        sock_dir = __opts__['sock_dir']
+
     event = salt.utils.event.get_event(
         'master',
         sock_dir,
         transport,
         listen=False)
+
     try:
         event.fire_event(msg, tag)
     except ValueError:
@@ -1786,88 +1855,117 @@ def scp_file(dest_path, contents=None, kwargs=None, local_file=None):
     '''
     Use scp or sftp to copy a file to a server
     '''
-    if contents is not None:
-        tmpfh, tmppath = tempfile.mkstemp()
-        with salt.utils.fopen(tmppath, 'w') as tmpfile:
-            tmpfile.write(contents)
+    file_to_upload = None
+    try:
+        if contents is not None:
+            try:
+                tmpfd, file_to_upload = tempfile.mkstemp()
+                os.write(tmpfd, contents)
+            finally:
+                try:
+                    os.close(tmpfd)
+                except OSError as exc:
+                    if exc.errno != errno.EBADF:
+                        raise exc
 
-    log.debug('Uploading {0} to {1}'.format(dest_path, kwargs['hostname']))
+        log.debug('Uploading {0} to {1}'.format(dest_path, kwargs['hostname']))
 
-    ssh_args = [
-        # Don't add new hosts to the host key database
-        '-oStrictHostKeyChecking=no',
-        # Set hosts key database path to /dev/null, i.e., non-existing
-        '-oUserKnownHostsFile=/dev/null',
-        # Don't re-use the SSH connection. Less failures.
-        '-oControlPath=none'
-    ]
+        ssh_args = [
+            # Don't add new hosts to the host key database
+            '-oStrictHostKeyChecking=no',
+            # Set hosts key database path to /dev/null, i.e., non-existing
+            '-oUserKnownHostsFile=/dev/null',
+            # Don't re-use the SSH connection. Less failures.
+            '-oControlPath=none'
+        ]
 
-    if local_file is not None:
-        tmppath = local_file
-        if os.path.isdir(local_file):
-            ssh_args.append('-r')
+        if local_file is not None:
+            file_to_upload = local_file
+            if os.path.isdir(local_file):
+                ssh_args.append('-r')
 
-    if 'key_filename' in kwargs:
-        # There should never be both a password and an ssh key passed in, so
-        ssh_args.extend([
-            # tell SSH to skip password authentication
-            '-oPasswordAuthentication=no',
-            '-oChallengeResponseAuthentication=no',
-            # Make sure public key authentication is enabled
-            '-oPubkeyAuthentication=yes',
-            # do only use the provided identity file
-            '-oIdentitiesOnly=yes',
-            # No Keyboard interaction!
-            '-oKbdInteractiveAuthentication=no',
-            # Also, specify the location of the key file
-            '-i {0}'.format(kwargs['key_filename'])
-        ])
+        if 'key_filename' in kwargs:
+            # There should never be both a password and an ssh key passed in, so
+            ssh_args.extend([
+                # tell SSH to skip password authentication
+                '-oPasswordAuthentication=no',
+                '-oChallengeResponseAuthentication=no',
+                # Make sure public key authentication is enabled
+                '-oPubkeyAuthentication=yes',
+                # do only use the provided identity file
+                '-oIdentitiesOnly=yes',
+                # No Keyboard interaction!
+                '-oKbdInteractiveAuthentication=no',
+                # Also, specify the location of the key file
+                '-i {0}'.format(kwargs['key_filename'])
+            ])
 
-    if 'port' in kwargs:
-        ssh_args.append('-oPort={0}'.format(kwargs['port']))
+        if 'port' in kwargs:
+            ssh_args.append('-oPort={0}'.format(kwargs['port']))
 
-    if 'ssh_gateway' in kwargs:
-        ssh_gateway = kwargs['ssh_gateway']
-        ssh_gateway_port = 22
-        ssh_gateway_key = ''
-        ssh_gateway_user = 'root'
-        if ':' in ssh_gateway:
-            ssh_gateway, ssh_gateway_port = ssh_gateway.split(':')
-        if 'ssh_gateway_port' in kwargs:
-            ssh_gateway_port = kwargs['ssh_gateway_port']
-        if 'ssh_gateway_key' in kwargs:
-            ssh_gateway_key = '-i {0}'.format(kwargs['ssh_gateway_key'])
-        if 'ssh_gateway_user' in kwargs:
-            ssh_gateway_user = kwargs['ssh_gateway_user']
+        if 'ssh_gateway' in kwargs:
+            ssh_gateway = kwargs['ssh_gateway']
+            ssh_gateway_port = 22
+            ssh_gateway_key = ''
+            ssh_gateway_user = 'root'
+            if ':' in ssh_gateway:
+                ssh_gateway, ssh_gateway_port = ssh_gateway.split(':')
+            if 'ssh_gateway_port' in kwargs:
+                ssh_gateway_port = kwargs['ssh_gateway_port']
+            if 'ssh_gateway_key' in kwargs:
+                ssh_gateway_key = '-i {0}'.format(kwargs['ssh_gateway_key'])
+            if 'ssh_gateway_user' in kwargs:
+                ssh_gateway_user = kwargs['ssh_gateway_user']
 
-        ssh_args.append(
-            # Setup ProxyCommand
-            '-oProxyCommand="ssh {0} {1} {2} {3} {4}@{5} -p {6} nc -q0 %h %p"'.format(
-                # Don't add new hosts to the host key database
-                '-oStrictHostKeyChecking=no',
-                # Set hosts key database path to /dev/null, i.e., non-existing
-                '-oUserKnownHostsFile=/dev/null',
-                # Don't re-use the SSH connection. Less failures.
-                '-oControlPath=none',
-                ssh_gateway_key,
-                ssh_gateway_user,
-                ssh_gateway,
-                ssh_gateway_port
+            ssh_args.append(
+                # Setup ProxyCommand
+                '-oProxyCommand="ssh {0} {1} {2} {3} {4}@{5} -p {6} nc -q0 %h %p"'.format(
+                    # Don't add new hosts to the host key database
+                    '-oStrictHostKeyChecking=no',
+                    # Set hosts key database path to /dev/null, i.e., non-existing
+                    '-oUserKnownHostsFile=/dev/null',
+                    # Don't re-use the SSH connection. Less failures.
+                    '-oControlPath=none',
+                    ssh_gateway_key,
+                    ssh_gateway_user,
+                    ssh_gateway,
+                    ssh_gateway_port
+                )
+            )
+
+        try:
+            if socket.inet_pton(socket.AF_INET6, kwargs['hostname']):
+                ipaddr = '[{0}]'.format(kwargs['hostname'])
+            else:
+                ipaddr = kwargs['hostname']
+        except socket.error:
+            ipaddr = kwargs['hostname']
+
+        if file_to_upload is None:
+            log.warning(
+                'No source file to upload. Please make sure that either file '
+                'contents or the path to a local file are provided.'
+            )
+        cmd = (
+            'scp {0} {1} {2[username]}@{4}:{3} || '
+            'echo "put {1} {3}" | sftp {0} {2[username]}@{4} || '
+            'rsync -avz -e "ssh {0}" {1} {2[username]}@{2[hostname]}:{3}'.format(
+                ' '.join(ssh_args), file_to_upload, kwargs, dest_path, ipaddr
             )
         )
-    cmd = (
-        'scp {0} {1} {2[username]}@{2[hostname]}:{3} || '
-        'echo "put {1} {3}" | sftp {0} {2[username]}@{2[hostname]} || '
-        'rsync -avz -e "ssh {0}" {1} {2[username]}@{2[hostname]}:{3}'.format(
-            ' '.join(ssh_args), tmppath, kwargs, dest_path
-        )
-    )
 
-    log.debug('SCP command: \'{0}\''.format(cmd))
-    retcode = _exec_ssh_cmd(cmd,
-                            error_msg='Failed to upload file \'{0}\': {1}\n{2}',
-                            password_retries=3,
-                            **kwargs)
+        log.debug('SCP command: \'{0}\''.format(cmd))
+        retcode = _exec_ssh_cmd(cmd,
+                                error_msg='Failed to upload file \'{0}\': {1}\n{2}',
+                                password_retries=3,
+                                **kwargs)
+    finally:
+        if contents is not None:
+            try:
+                os.remove(file_to_upload)
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:
+                    raise exc
     return retcode
 
 
@@ -1890,83 +1988,114 @@ def sftp_file(dest_path, contents=None, kwargs=None, local_file=None):
     if kwargs is None:
         kwargs = {}
 
-    if contents is not None:
-        tmpfh, tmppath = tempfile.mkstemp()
-        with salt.utils.fopen(tmppath, 'w') as tmpfile:
-            tmpfile.write(contents)
+    file_to_upload = None
+    try:
+        if contents is not None:
+            try:
+                tmpfd, file_to_upload = tempfile.mkstemp()
+                if isinstance(contents, str):
+                    os.write(tmpfd, contents.encode(__salt_system_encoding__))
+                else:
+                    os.write(tmpfd, contents)
+            finally:
+                try:
+                    os.close(tmpfd)
+                except OSError as exc:
+                    if exc.errno != errno.EBADF:
+                        raise exc
 
-    if local_file is not None:
-        tmppath = local_file
-        if os.path.isdir(local_file):
-            put_args = ['-r']
+        if local_file is not None:
+            file_to_upload = local_file
+            if os.path.isdir(local_file):
+                put_args = ['-r']
 
-    log.debug('Uploading {0} to {1} (sfcp)'.format(dest_path, kwargs.get('hostname')))
+        log.debug('Uploading {0} to {1} (sftp)'.format(dest_path, kwargs.get('hostname')))
 
-    ssh_args = [
-        # Don't add new hosts to the host key database
-        '-oStrictHostKeyChecking=no',
-        # Set hosts key database path to /dev/null, i.e., non-existing
-        '-oUserKnownHostsFile=/dev/null',
-        # Don't re-use the SSH connection. Less failures.
-        '-oControlPath=none'
-    ]
-    if 'key_filename' in kwargs:
-        # There should never be both a password and an ssh key passed in, so
-        ssh_args.extend([
-            # tell SSH to skip password authentication
-            '-oPasswordAuthentication=no',
-            '-oChallengeResponseAuthentication=no',
-            # Make sure public key authentication is enabled
-            '-oPubkeyAuthentication=yes',
-            # do only use the provided identity file
-            '-oIdentitiesOnly=yes',
-            # No Keyboard interaction!
-            '-oKbdInteractiveAuthentication=no',
-            # Also, specify the location of the key file
-            '-oIdentityFile={0}'.format(kwargs['key_filename'])
-        ])
+        ssh_args = [
+            # Don't add new hosts to the host key database
+            '-oStrictHostKeyChecking=no',
+            # Set hosts key database path to /dev/null, i.e., non-existing
+            '-oUserKnownHostsFile=/dev/null',
+            # Don't re-use the SSH connection. Less failures.
+            '-oControlPath=none'
+        ]
+        if 'key_filename' in kwargs:
+            # There should never be both a password and an ssh key passed in, so
+            ssh_args.extend([
+                # tell SSH to skip password authentication
+                '-oPasswordAuthentication=no',
+                '-oChallengeResponseAuthentication=no',
+                # Make sure public key authentication is enabled
+                '-oPubkeyAuthentication=yes',
+                # do only use the provided identity file
+                '-oIdentitiesOnly=yes',
+                # No Keyboard interaction!
+                '-oKbdInteractiveAuthentication=no',
+                # Also, specify the location of the key file
+                '-oIdentityFile={0}'.format(kwargs['key_filename'])
+            ])
 
-    if 'port' in kwargs:
-        ssh_args.append('-oPort={0}'.format(kwargs['port']))
+        if 'port' in kwargs:
+            ssh_args.append('-oPort={0}'.format(kwargs['port']))
 
-    if 'ssh_gateway' in kwargs:
-        ssh_gateway = kwargs['ssh_gateway']
-        ssh_gateway_port = 22
-        ssh_gateway_key = ''
-        ssh_gateway_user = 'root'
-        if ':' in ssh_gateway:
-            ssh_gateway, ssh_gateway_port = ssh_gateway.split(':')
-        if 'ssh_gateway_port' in kwargs:
-            ssh_gateway_port = kwargs['ssh_gateway_port']
-        if 'ssh_gateway_key' in kwargs:
-            ssh_gateway_key = '-i {0}'.format(kwargs['ssh_gateway_key'])
-        if 'ssh_gateway_user' in kwargs:
-            ssh_gateway_user = kwargs['ssh_gateway_user']
+        if 'ssh_gateway' in kwargs:
+            ssh_gateway = kwargs['ssh_gateway']
+            ssh_gateway_port = 22
+            ssh_gateway_key = ''
+            ssh_gateway_user = 'root'
+            if ':' in ssh_gateway:
+                ssh_gateway, ssh_gateway_port = ssh_gateway.split(':')
+            if 'ssh_gateway_port' in kwargs:
+                ssh_gateway_port = kwargs['ssh_gateway_port']
+            if 'ssh_gateway_key' in kwargs:
+                ssh_gateway_key = '-i {0}'.format(kwargs['ssh_gateway_key'])
+            if 'ssh_gateway_user' in kwargs:
+                ssh_gateway_user = kwargs['ssh_gateway_user']
 
-        ssh_args.append(
-            # Setup ProxyCommand
-            '-oProxyCommand="ssh {0} {1} {2} {3} {4}@{5} -p {6} nc -q0 %h %p"'.format(
-                # Don't add new hosts to the host key database
-                '-oStrictHostKeyChecking=no',
-                # Set hosts key database path to /dev/null, i.e., non-existing
-                '-oUserKnownHostsFile=/dev/null',
-                # Don't re-use the SSH connection. Less failures.
-                '-oControlPath=none',
-                ssh_gateway_key,
-                ssh_gateway_user,
-                ssh_gateway,
-                ssh_gateway_port
+            ssh_args.append(
+                # Setup ProxyCommand
+                '-oProxyCommand="ssh {0} {1} {2} {3} {4}@{5} -p {6} nc -q0 %h %p"'.format(
+                    # Don't add new hosts to the host key database
+                    '-oStrictHostKeyChecking=no',
+                    # Set hosts key database path to /dev/null, i.e., non-existing
+                    '-oUserKnownHostsFile=/dev/null',
+                    # Don't re-use the SSH connection. Less failures.
+                    '-oControlPath=none',
+                    ssh_gateway_key,
+                    ssh_gateway_user,
+                    ssh_gateway,
+                    ssh_gateway_port
+                )
             )
-        )
 
-    cmd = 'echo "put {0} {1} {2}" | sftp {3} {4[username]}@{4[hostname]}'.format(
-        ' '.join(put_args), tmppath, dest_path, ' '.join(ssh_args), kwargs
-    )
-    log.debug('SFTP command: \'{0}\''.format(cmd))
-    retcode = _exec_ssh_cmd(cmd,
-                            error_msg='Failed to upload file \'{0}\': {1}\n{2}',
-                            password_retries=3,
-                            **kwargs)
+        try:
+            if socket.inet_pton(socket.AF_INET6, kwargs['hostname']):
+                ipaddr = '[{0}]'.format(kwargs['hostname'])
+            else:
+                ipaddr = kwargs['hostname']
+        except socket.error:
+            ipaddr = kwargs['hostname']
+
+        if file_to_upload is None:
+            log.warning(
+                'No source file to upload. Please make sure that either file '
+                'contents or the path to a local file are provided.'
+            )
+        cmd = 'echo "put {0} {1} {2}" | sftp {3} {4[username]}@{5}'.format(
+            ' '.join(put_args), file_to_upload, dest_path, ' '.join(ssh_args), kwargs, ipaddr
+        )
+        log.debug('SFTP command: \'{0}\''.format(cmd))
+        retcode = _exec_ssh_cmd(cmd,
+                                error_msg='Failed to upload file \'{0}\': {1}\n{2}',
+                                password_retries=3,
+                                **kwargs)
+    finally:
+        if contents is not None:
+            try:
+                os.remove(file_to_upload)
+            except OSError as exc:
+                if exc.errno != errno.ENOENT:
+                    raise exc
     return retcode
 
 
@@ -1988,17 +2117,13 @@ def win_cmd(command, **kwargs):
 
         if logging_command is None:
             log.debug(
-                'Executing command(PID {0}): {1!r}'.format(
-                    proc.pid,
-                    command
-                )
+                'Executing command(PID %s): \'%s\'',
+                proc.pid, command
             )
         else:
             log.debug(
-                'Executing command(PID {0}): {1!r}'.format(
-                    proc.pid,
-                    logging_command
-                )
+                'Executing command(PID %s): \'%s\'',
+                proc.pid, logging_command
             )
 
         proc.poll_and_read_until_finish()
@@ -2006,7 +2131,7 @@ def win_cmd(command, **kwargs):
         return proc.returncode
     except Exception as err:
         log.error(
-            'Failed to execute command {0!r}: {1}\n'.format(
+            'Failed to execute command \'{0}\': {1}\n'.format(
                 logging_command,
                 err
             ),
@@ -2185,13 +2310,16 @@ def is_public_ip(ip):
         return True
     addr = ip_to_int(ip)
     if addr > 167772160 and addr < 184549375:
-        # 10.0.0.0/24
+        # 10.0.0.0/8
         return False
     elif addr > 3232235520 and addr < 3232301055:
         # 192.168.0.0/16
         return False
     elif addr > 2886729728 and addr < 2887778303:
         # 172.16.0.0/12
+        return False
+    elif addr > 2130706432 and addr < 2147483647:
+        # 127.0.0.0/8
         return False
     return True
 
@@ -2317,43 +2445,6 @@ def wait_for_ip(update_callback,
                      'now {0}s.'.format(interval))
 
 
-def simple_types_filter(data):
-    '''
-    Convert the data list, dictionary into simple types, i.e., int, float, string,
-    bool, etc.
-    '''
-    if data is None:
-        return data
-
-    simpletypes_keys = (six.string_types, six.text_type, six.integer_types, float, bool)
-    simpletypes_values = tuple(list(simpletypes_keys) + [list, tuple])
-
-    if isinstance(data, (list, tuple)):
-        simplearray = []
-        for value in data:
-            if value is not None:
-                if isinstance(value, (dict, list)):
-                    value = simple_types_filter(value)
-                elif not isinstance(value, simpletypes_values):
-                    value = repr(value)
-            simplearray.append(value)
-        return simplearray
-
-    if isinstance(data, dict):
-        simpledict = {}
-        for key, value in six.iteritems(data):
-            if key is not None and not isinstance(key, simpletypes_keys):
-                key = repr(key)
-            if value is not None and isinstance(value, (dict, list, tuple)):
-                value = simple_types_filter(value)
-            elif value is not None and not isinstance(value, simpletypes_values):
-                value = repr(value)
-            simpledict[key] = value
-        return simpledict
-
-    return data
-
-
 def list_nodes_select(nodes, selection, call=None):
     '''
     Return a list of the VMs that are on the provider, with select fields
@@ -2384,6 +2475,45 @@ def list_nodes_select(nodes, selection, call=None):
     return ret
 
 
+def lock_file(filename, interval=.5, timeout=15):
+    '''
+    Lock a file; if it is already locked, then wait for it to become available
+    before locking it.
+
+    Note that these locks are only recognized by Salt Cloud, and not other
+    programs or platforms.
+    '''
+    log.trace('Attempting to obtain lock for {0}'.format(filename))
+    lock = filename + '.lock'
+    start = time.time()
+    while True:
+        if os.path.exists(lock):
+            if time.time() - start >= timeout:
+                log.warning('Unable to obtain lock for {0}'.format(filename))
+                return False
+            time.sleep(interval)
+        else:
+            break
+
+    with salt.utils.fopen(lock, 'a'):
+        pass
+
+
+def unlock_file(filename):
+    '''
+    Unlock a locked file
+
+    Note that these locks are only recognized by Salt Cloud, and not other
+    programs or platforms.
+    '''
+    log.trace('Removing lock for {0}'.format(filename))
+    lock = filename + '.lock'
+    try:
+        os.remove(lock)
+    except OSError as exc:
+        log.trace('Unable to remove lock for {0}: {1}'.format(filename, exc))
+
+
 def cachedir_index_add(minion_id, profile, driver, provider, base=None):
     '''
     Add an entry to the cachedir index. This generally only needs to happen when
@@ -2401,6 +2531,7 @@ def cachedir_index_add(minion_id, profile, driver, provider, base=None):
     '''
     base = init_cachedir(base)
     index_file = os.path.join(base, 'index.p')
+    lock_file(index_file)
 
     if os.path.exists(index_file):
         with salt.utils.fopen(index_file, 'r') as fh_:
@@ -2422,6 +2553,8 @@ def cachedir_index_add(minion_id, profile, driver, provider, base=None):
     with salt.utils.fopen(index_file, 'w') as fh_:
         msgpack.dump(index, fh_)
 
+    unlock_file(index_file)
+
 
 def cachedir_index_del(minion_id, base=None):
     '''
@@ -2430,6 +2563,7 @@ def cachedir_index_del(minion_id, base=None):
     '''
     base = init_cachedir(base)
     index_file = os.path.join(base, 'index.p')
+    lock_file(index_file)
 
     if os.path.exists(index_file):
         with salt.utils.fopen(index_file, 'r') as fh_:
@@ -2443,13 +2577,15 @@ def cachedir_index_del(minion_id, base=None):
     with salt.utils.fopen(index_file, 'w') as fh_:
         msgpack.dump(index, fh_)
 
+    unlock_file(index_file)
+
 
 def init_cachedir(base=None):
     '''
     Initialize the cachedir needed for Salt Cloud to keep track of minions
     '''
     if base is None:
-        base = os.path.join(syspaths.CACHE_DIR, 'cloud')
+        base = __opts__['cachedir']
     needed_dirs = (base,
                    os.path.join(base, 'requested'),
                    os.path.join(base, 'active'))
@@ -2461,8 +2597,10 @@ def init_cachedir(base=None):
     return base
 
 
+# FIXME: This function seems used nowhere. Dead code?
 def request_minion_cachedir(
         minion_id,
+        opts=None,
         fingerprint='',
         pubkey=None,
         provider=None,
@@ -2478,10 +2616,10 @@ def request_minion_cachedir(
     will be set to None.
     '''
     if base is None:
-        base = os.path.join(syspaths.CACHE_DIR, 'cloud')
+        base = __opts__['cachedir']
 
     if not fingerprint and pubkey is not None:
-        fingerprint = salt.utils.pem_finger(key=pubkey)
+        fingerprint = salt.utils.pem_finger(key=pubkey, sum_type=(opts and opts.get('hash_type') or 'sha256'))
 
     init_cachedir(base)
 
@@ -2520,7 +2658,7 @@ def change_minion_cachedir(
         return False
 
     if base is None:
-        base = os.path.join(syspaths.CACHE_DIR, 'cloud')
+        base = __opts__['cachedir']
 
     fname = '{0}.p'.format(minion_id)
     path = os.path.join(base, cachedir, fname)
@@ -2541,7 +2679,7 @@ def activate_minion_cachedir(minion_id, base=None):
     exists, and should be expected to exist from here on out.
     '''
     if base is None:
-        base = os.path.join(syspaths.CACHE_DIR, 'cloud')
+        base = __opts__['cachedir']
 
     fname = '{0}.p'.format(minion_id)
     src = os.path.join(base, 'requested', fname)
@@ -2555,13 +2693,16 @@ def delete_minion_cachedir(minion_id, provider, opts, base=None):
     all cachedirs to find the minion's cache file.
     Needs `update_cachedir` set to True.
     '''
-    if opts.get('update_cachedir', False) is False:
+    if isinstance(opts, dict):
+        __opts__.update(opts)
+
+    if __opts__.get('update_cachedir', False) is False:
         return
 
     if base is None:
-        base = os.path.join(syspaths.CACHE_DIR, 'cloud')
+        base = __opts__['cachedir']
 
-    driver = next(six.iterkeys(opts['providers'][provider]))
+    driver = next(six.iterkeys(__opts__['providers'][provider]))
     fname = '{0}.p'.format(minion_id)
     for cachedir in 'requested', 'active':
         path = os.path.join(base, cachedir, driver, provider, fname)
@@ -2570,16 +2711,18 @@ def delete_minion_cachedir(minion_id, provider, opts, base=None):
             os.remove(path)
 
 
-def list_cache_nodes_full(opts, provider=None, base=None):
+def list_cache_nodes_full(opts=None, provider=None, base=None):
     '''
     Return a list of minion data from the cloud cache, rather from the cloud
     providers themselves. This is the cloud cache version of list_nodes_full().
     '''
+    if opts is None:
+        opts = __opts__
     if opts.get('update_cachedir', False) is False:
         return
 
     if base is None:
-        base = os.path.join(syspaths.CACHE_DIR, 'cloud', 'active')
+        base = os.path.join(opts['cachedir'], 'active')
 
     minions = {}
     # First, get a list of all drivers in use
@@ -2594,10 +2737,10 @@ def list_cache_nodes_full(opts, provider=None, base=None):
             minions[driver][prov] = {}
             min_dir = os.path.join(prov_dir, prov)
             # Get a list of all nodes per provider
-            for minion_id in os.listdir(min_dir):
+            for fname in os.listdir(min_dir):
                 # Finally, get a list of full minion data
-                fname = '{0}.p'.format(minion_id)
                 fpath = os.path.join(min_dir, fname)
+                minion_id = fname[:-2]  # strip '.p' from end of msgpack filename
                 with salt.utils.fopen(fpath, 'r') as fh_:
                     minions[driver][prov][minion_id] = msgpack.load(fh_)
 
@@ -2610,7 +2753,7 @@ def cache_nodes_ip(opts, base=None):
     addresses. Returns a dict.
     '''
     if base is None:
-        base = os.path.join(syspaths.CACHE_DIR, 'cloud')
+        base = opts['cachedir']
 
     minions = list_cache_nodes_full(opts, base=base)
 
@@ -2619,13 +2762,11 @@ def update_bootstrap(config, url=None):
     '''
     Update the salt-bootstrap script
 
-        url can be either:
+    url can be one of:
 
-            - The URL to fetch the bootstrap script from
-            - The absolute path to the bootstrap
-            - The content of the bootstrap script
-
-
+        - The URL to fetch the bootstrap script from
+        - The absolute path to the bootstrap
+        - The content of the bootstrap script
     '''
     default_url = config.get('bootstrap_script_url',
                              'https://bootstrap.saltstack.com')
@@ -2686,7 +2827,7 @@ def update_bootstrap(config, url=None):
     # Compute the search path using the install time defined
     # syspaths.CONF_DIR
     deploy_d_from_syspaths = os.path.join(
-        syspaths.CONFIG_DIR,
+        config['config_dir'],
         'cloud.deploy.d'
     )
 
@@ -2789,13 +2930,16 @@ def cache_node(node, provider, opts):
 
     .. versionadded:: 2014.7.0
     '''
-    if 'update_cachedir' not in opts or not opts['update_cachedir']:
+    if isinstance(opts, dict):
+        __opts__.update(opts)
+
+    if 'update_cachedir' not in __opts__ or not __opts__['update_cachedir']:
         return
 
-    if not os.path.exists(os.path.join(syspaths.CACHE_DIR, 'cloud', 'active')):
+    if not os.path.exists(os.path.join(__opts__['cachedir'], 'active')):
         init_cachedir()
 
-    base = os.path.join(syspaths.CACHE_DIR, 'cloud', 'active')
+    base = os.path.join(__opts__['cachedir'], 'active')
     provider, driver = provider.split(':')
     prov_dir = os.path.join(base, driver, provider)
     if not os.path.exists(prov_dir):
@@ -2823,8 +2967,6 @@ def missing_node_cache(prov_dir, node_list, provider, opts):
     for node in os.listdir(prov_dir):
         cached_nodes.append(os.path.splitext(node)[0])
 
-    log.debug(sorted(cached_nodes))
-    log.debug(sorted(node_list))
     for node in cached_nodes:
         if node not in node_list:
             delete_minion_cachedir(node, provider, opts)
@@ -2833,7 +2975,10 @@ def missing_node_cache(prov_dir, node_list, provider, opts):
                     'event',
                     'cached node missing from provider',
                     'salt/cloud/{0}/cache_node_missing'.format(node),
-                    {'missing node': node},
+                    args={'missing node': node},
+                    sock_dir=opts.get(
+                        'sock_dir',
+                        os.path.join(__opts__['sock_dir'], 'master')),
                     transport=opts.get('transport', 'zeromq')
                 )
 
@@ -2857,8 +3002,7 @@ def diff_node_cache(prov_dir, node, new_data, opts):
 
     if node is None:
         return
-    path = os.path.join(prov_dir, node)
-    path = '{0}.p'.format(path)
+    path = '{0}.p'.format(os.path.join(prov_dir, node))
 
     if not os.path.exists(path):
         event_data = _strip_cache_events(new_data, opts)
@@ -2867,7 +3011,10 @@ def diff_node_cache(prov_dir, node, new_data, opts):
             'event',
             'new node found',
             'salt/cloud/{0}/cache_node_new'.format(node),
-            {'new_data': event_data},
+            args={'new_data': event_data},
+            sock_dir=opts.get(
+                'sock_dir',
+                os.path.join(__opts__['sock_dir'], 'master')),
             transport=opts.get('transport', 'zeromq')
         )
         return
@@ -2888,10 +3035,13 @@ def diff_node_cache(prov_dir, node, new_data, opts):
             'event',
             'node data differs',
             'salt/cloud/{0}/cache_node_diff'.format(node),
-            {
+            args={
                 'new_data': _strip_cache_events(new_data, opts),
                 'cache_data': _strip_cache_events(cache_data, opts),
             },
+            sock_dir=opts.get(
+                'sock_dir',
+                os.path.join(__opts__['sock_dir'], 'master')),
             transport=opts.get('transport', 'zeromq')
         )
 
@@ -3067,7 +3217,7 @@ def check_key_path_and_mode(provider, key_path):
 
     Returns True or False.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     provider
         The provider name that the key_path to check belongs to.
@@ -3086,8 +3236,8 @@ def check_key_path_and_mode(provider, key_path):
         )
         return False
 
-    key_mode = str(oct(stat.S_IMODE(os.stat(key_path).st_mode)))
-    if key_mode not in ('0400', '0600'):
+    key_mode = stat.S_IMODE(os.stat(key_path).st_mode)
+    if key_mode not in (0o400, 0o600):
         log.error(
             'The key file \'{0}\' used in the \'{1}\' provider configuration '
             'needs to be set to mode 0400 or 0600.\n'.format(

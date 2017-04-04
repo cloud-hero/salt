@@ -1,12 +1,12 @@
 [Unit]
 Description=The Salt Minion
-After=syslog.target network.target
+After=network.target salt-master.service
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
 LimitNOFILE=8192
 ExecStart=/usr/bin/salt-minion
-KillMode=process
 
 [Install]
 WantedBy=multi-user.target

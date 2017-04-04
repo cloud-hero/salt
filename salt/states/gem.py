@@ -79,12 +79,12 @@ def installed(name,          # pylint: disable=C0103
         Format: http://hostname[:port]
     '''
     ret = {'name': name, 'result': None, 'comment': '', 'changes': {}}
-    if ruby is not None and (__salt__['rvm.is_installed'](runas=user) or __salt__['rbenv.is_installed'](runas=user)):
+    if ruby is not None and not(__salt__['rvm.is_installed'](runas=user) or __salt__['rbenv.is_installed'](runas=user)):
         log.warning(
             'Use of argument ruby found, but neither rvm or rbenv is installed'
         )
     gems = __salt__['gem.list'](name, ruby, gem_bin=gem_bin, runas=user)
-    if name in gems and version is not None and version in gems[name]:
+    if name in gems and version is not None and str(version) in gems[name]:
         ret['result'] = True
         ret['comment'] = 'Gem is already installed.'
         return ret

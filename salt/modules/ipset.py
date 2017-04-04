@@ -2,17 +2,24 @@
 '''
 Support for ipset
 '''
-from __future__ import absolute_import
 
 # Import python libs
+from __future__ import absolute_import
 import logging
 
-# Import 3rd-party libs
+# Import Salt libs
 import salt.ext.six as six
+from salt.ext.six.moves import map, range
+import salt.utils
+
+# Import third-party libs
 if six.PY3:
     import ipaddress
 else:
     import salt.ext.ipaddress as ipaddress
+
+# Set up logging
+log = logging.getLogger(__name__)
 
 
 # Fix included in py2-ipaddress for 32bit architectures
@@ -21,12 +28,6 @@ def long_range(start, end):
     while start < end:
         yield start
         start += 1
-
-# Import salt libs
-import salt.utils
-
-# Set up logging
-log = logging.getLogger(__name__)
 
 _IPSET_FAMILIES = {
         'ipv4': 'inet',
@@ -109,7 +110,7 @@ def __virtual__():
     '''
     if salt.utils.which('ipset'):
         return True
-    return False
+    return (False, 'The ipset execution modules cannot be loaded: ipset binary not in path.')
 
 
 def _ipset_cmd():
@@ -427,47 +428,23 @@ def check(set=None, entry=None, family='ipv4'):
     if not settype:
         return 'Error: Set {0} does not exist'.format(set)
 
+    current_members = _parse_members(settype, _find_set_members(set))
+
+    if not len(current_members):
+        return False
+
     if isinstance(entry, list):
-        entries = entry
+        entries = _parse_members(settype, entry)
     else:
-        if entry.find('-') != -1 and entry.count('-') == 1:
-            start, end = entry.split('-')
+        entries = [_parse_member(settype, entry)]
 
-            if settype == 'hash:ip':
-                entries = [str(ipaddress.ip_address(ip)) for ip in long_range(
-                    ipaddress.ip_address(start),
-                    ipaddress.ip_address(end) + 1
-                )]
+    for current_member in current_members:
+        for entry in entries:
+            if _member_contains(current_member, entry):
+                # print "{0} contains {1}".format(current_member, entry)
+                return True
 
-            elif settype == 'hash:net':
-                networks = ipaddress.summarize_address_range(ipaddress.ip_address(start),
-                                                             ipaddress.ip_address(end))
-                entries = []
-                for network in networks:
-                    entries.append(network.with_prefixlen)
-            else:
-                entries = [entry]
-
-        elif entry.find('/') != -1 and entry.count('/') == 1:
-            if settype == 'hash:ip':
-                entries = [str(ip) for ip in ipaddress.ip_network(entry)]
-            elif settype == 'hash:net':
-                _entries = [str(ip) for ip in ipaddress.ip_network(entry)]
-                if len(_entries) == 1:
-                    entries = [_entries[0]]
-                else:
-                    entries = [entry]
-            else:
-                entries = [entry]
-        else:
-            entries = [entry]
-
-    current_members = _find_set_members(set)
-    for entry in entries:
-        if entry not in current_members:
-            return False
-
-    return True
+    return False
 
 
 def test(set=None, entry=None, family='ipv4', **kwargs):
@@ -527,10 +504,10 @@ def flush(set=None, family='ipv4'):
 
     ipset_family = _IPSET_FAMILIES[family]
     if set:
-        #cmd = '{0} flush {1} family {2}'.format(_ipset_cmd(), set, ipset_family)
+        # cmd = '{0} flush {1} family {2}'.format(_ipset_cmd(), set, ipset_family)
         cmd = '{0} flush {1}'.format(_ipset_cmd(), set)
     else:
-        #cmd = '{0} flush family {1}'.format(_ipset_cmd(), ipset_family)
+        # cmd = '{0} flush family {1}'.format(_ipset_cmd(), ipset_family)
         cmd = '{0} flush'.format(_ipset_cmd())
     out = __salt__['cmd.run'](cmd, python_shell=False)
 
@@ -595,3 +572,104 @@ def _find_set_type(set):
         return setinfo['Type']
     else:
         return False
+
+
+def _parse_members(settype, members):
+    if isinstance(members, six.string_types):
+
+        return [_parse_member(settype, members)]
+
+    return [_parse_member(settype, member) for member in members]
+
+
+def _parse_member(settype, member, strict=False):
+    subtypes = settype.split(':')[1].split(',')
+
+    parts = member.split(' ')
+
+    parsed_member = []
+    for i in range(len(subtypes)):
+        subtype = subtypes[i]
+        part = parts[i]
+
+        if subtype in ['ip', 'net']:
+            try:
+                if '/' in part:
+                    part = ipaddress.ip_network(part, strict=strict)
+                elif '-' in part:
+                    start, end = list(map(ipaddress.ip_address, part.split('-')))
+
+                    part = list(ipaddress.summarize_address_range(start, end))
+                else:
+                    part = ipaddress.ip_address(part)
+            except ValueError:
+                pass
+
+        elif subtype == 'port':
+            part = int(part)
+
+        parsed_member.append(part)
+
+    if len(parts) > len(subtypes):
+        parsed_member.append(' '.join(parts[len(subtypes):]))
+
+    return parsed_member
+
+
+def _members_contain(members, entry):
+    pass
+
+
+def _member_contains(member, entry):
+    if len(member) < len(entry):
+        return False
+
+    for i in range(len(entry)):
+        if not _compare_member_parts(member[i], entry[i]):
+            return False
+
+    return True
+
+
+def _compare_member_parts(member_part, entry_part):
+    if member_part == entry_part:
+        # this covers int, string, and equal ip and net
+        return True
+
+    # for ip ranges parsed with summarize_address_range
+    if isinstance(entry_part, list):
+        for entry_part_item in entry_part:
+            if not _compare_member_parts(member_part, entry_part_item):
+                return False
+
+        return True
+
+    # below we only deal with ip and net objects
+    if _is_address(member_part):
+        if _is_network(entry_part):
+            return member_part in entry_part
+
+    elif _is_network(member_part):
+        if _is_address(entry_part):
+            return entry_part in member_part
+
+        # both are networks, and == was false
+        return False
+
+        # This could be changed to support things like
+        # 192.168.0.4/30 contains 192.168.0.4/31
+        #
+        # return entry_part.network_address in member_part \
+        #    and entry_part.broadcast_address in member_part
+
+    return False
+
+
+def _is_network(o):
+    return isinstance(o, ipaddress.IPv4Network) \
+        or isinstance(o, ipaddress.IPv6Network)
+
+
+def _is_address(o):
+    return isinstance(o, ipaddress.IPv4Address) \
+        or isinstance(o, ipaddress.IPv6Address)

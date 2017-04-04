@@ -18,6 +18,7 @@ from __future__ import absolute_import
 import os
 import re
 import sys
+import time
 import types
 import socket
 import logging
@@ -31,6 +32,7 @@ from salt.ext.six.moves.urllib.parse import urlparse  # pylint: disable=import-e
 
 # Let's define these custom logging levels before importing the salt.log.mixins
 # since they will be used there
+PROFILE = logging.PROFILE = 15
 TRACE = logging.TRACE = 5
 GARBAGE = logging.GARBAGE = 1
 QUIET = logging.QUIET = 1000
@@ -42,6 +44,7 @@ from salt.log.handlers import (TemporaryLoggingHandler,
                                SysLogHandler,
                                FileHandler,
                                WatchedFileHandler,
+                               RotatingFileHandler,
                                QueueHandler)
 from salt.log.mixins import LoggingMixInMeta, NewStyleClassMixIn
 
@@ -53,6 +56,7 @@ LOG_LEVELS = {
     'critical': logging.CRITICAL,
     'garbage': GARBAGE,
     'info': logging.INFO,
+    'profile': PROFILE,
     'quiet': QUIET,
     'trace': TRACE,
     'warning': logging.WARNING,
@@ -66,10 +70,13 @@ LOG_COLORS = {
         'ERROR': TextFormat('bold', 'red'),
         'WARNING': TextFormat('bold', 'yellow'),
         'INFO': TextFormat('bold', 'green'),
+        'PROFILE': TextFormat('bold', 'cyan'),
         'DEBUG': TextFormat('bold', 'cyan'),
         'TRACE': TextFormat('bold', 'magenta'),
         'GARBAGE': TextFormat('bold', 'blue'),
         'NOTSET': TextFormat('reset'),
+        'SUBDEBUG': TextFormat('bold', 'cyan'),  # used by multiprocessing.log_to_stderr()
+        'SUBWARNING': TextFormat('bold', 'yellow'),  # used by multiprocessing.log_to_stderr()
     },
     'msgs': {
         'QUIET': TextFormat('reset'),
@@ -77,10 +84,13 @@ LOG_COLORS = {
         'ERROR': TextFormat('red'),
         'WARNING': TextFormat('yellow'),
         'INFO': TextFormat('green'),
+        'PROFILE': TextFormat('bold', 'cyan'),
         'DEBUG': TextFormat('cyan'),
         'TRACE': TextFormat('magenta'),
         'GARBAGE': TextFormat('blue'),
         'NOTSET': TextFormat('reset'),
+        'SUBDEBUG': TextFormat('bold', 'cyan'),  # used by multiprocessing.log_to_stderr()
+        'SUBWARNING': TextFormat('bold', 'yellow'),  # used by multiprocessing.log_to_stderr()
     },
     'name': TextFormat('bold', 'green'),
     'process': TextFormat('bold', 'blue'),
@@ -98,7 +108,9 @@ LOGGING_LOGGER_CLASS = logging.getLoggerClass()
 MODNAME_PATTERN = re.compile(r'(?P<name>%%\(name\)(?:\-(?P<digits>[\d]+))?s)')
 
 __CONSOLE_CONFIGURED = False
+__LOGGING_CONSOLE_HANDLER = None
 __LOGFILE_CONFIGURED = False
+__LOGGING_LOGFILE_HANDLER = None
 __TEMP_LOGGING_CONFIGURED = False
 __EXTERNAL_LOGGERS_CONFIGURED = False
 __MP_LOGGING_LISTENER_CONFIGURED = False
@@ -106,6 +118,7 @@ __MP_LOGGING_CONFIGURED = False
 __MP_LOGGING_QUEUE = None
 __MP_LOGGING_QUEUE_PROCESS = None
 __MP_LOGGING_QUEUE_HANDLER = None
+__MP_IN_MAINPROCESS = multiprocessing.current_process().name == 'MainProcess'
 
 
 def is_console_configured():
@@ -160,31 +173,32 @@ class SaltLogRecord(logging.LogRecord):
         # pylint: enable=E1321
 
 
-class SaltColorLogRecord(logging.LogRecord):
+class SaltColorLogRecord(SaltLogRecord):
     def __init__(self, *args, **kwargs):
-        logging.LogRecord.__init__(self, *args, **kwargs)
+        SaltLogRecord.__init__(self, *args, **kwargs)
+
         reset = TextFormat('reset')
+        clevel = LOG_COLORS['levels'].get(self.levelname, reset)
+        cmsg = LOG_COLORS['msgs'].get(self.levelname, reset)
 
         # pylint: disable=E1321
         self.colorname = '%s[%-17s]%s' % (LOG_COLORS['name'],
                                           self.name,
                                           reset)
-        self.colorlevel = '%s[%-8s]%s' % (LOG_COLORS['levels'][self.levelname],
+        self.colorlevel = '%s[%-8s]%s' % (clevel,
                                           self.levelname,
-                                          TextFormat('reset'))
+                                          reset)
         self.colorprocess = '%s[%5s]%s' % (LOG_COLORS['process'],
                                            self.process,
                                            reset)
-        self.colormsg = '%s%s%s' % (LOG_COLORS['msgs'][self.levelname],
-                                    self.msg,
-                                    reset)
+        self.colormsg = '%s%s%s' % (cmsg, self.getMessage(), reset)
         # pylint: enable=E1321
 
 
 _LOG_RECORD_FACTORY = SaltLogRecord
 
 
-def set_log_record_factory(factory):
+def setLogRecordFactory(factory):
     '''
     Set the factory to be used when instantiating a log record.
 
@@ -195,7 +209,7 @@ def set_log_record_factory(factory):
     _LOG_RECORD_FACTORY = factory
 
 
-def get_log_record_factory():
+def getLogRecordFactory():
     '''
     Return the factory to be used when instantiating a log record.
     '''
@@ -203,7 +217,7 @@ def get_log_record_factory():
     return _LOG_RECORD_FACTORY
 
 
-set_log_record_factory(SaltLogRecord)
+setLogRecordFactory(SaltLogRecord)
 
 
 class SaltLoggingClass(six.with_metaclass(LoggingMixInMeta, LOGGING_LOGGER_CLASS, NewStyleClassMixIn)):
@@ -360,6 +374,7 @@ if logging.getLoggerClass() is not SaltLoggingClass:
 
     logging.setLoggerClass(SaltLoggingClass)
     logging.addLevelName(QUIET, 'QUIET')
+    logging.addLevelName(PROFILE, 'PROFILE')
     logging.addLevelName(TRACE, 'TRACE')
     logging.addLevelName(GARBAGE, 'GARBAGE')
 
@@ -394,7 +409,7 @@ def setup_temp_logger(log_level='error'):
     Setup the temporary console logger
     '''
     if is_temp_logging_configured():
-        logging.getLogger(__name__).warn(
+        logging.getLogger(__name__).warning(
             'Temporary logging is already configured'
         )
         return
@@ -448,7 +463,7 @@ def setup_console_logger(log_level='error', log_format=None, date_format=None):
     Setup the console logger
     '''
     if is_console_configured():
-        logging.getLogger(__name__).warn('Console logging already configured')
+        logging.getLogger(__name__).warning('Console logging already configured')
         return
 
     # Remove the temporary logging handler
@@ -459,7 +474,7 @@ def setup_console_logger(log_level='error', log_format=None, date_format=None):
 
     level = LOG_LEVELS.get(log_level.lower(), logging.ERROR)
 
-    set_log_record_factory(SaltColorLogRecord)
+    setLogRecordFactory(SaltColorLogRecord)
 
     handler = None
     for handler in logging.root.handlers:
@@ -489,11 +504,13 @@ def setup_console_logger(log_level='error', log_format=None, date_format=None):
     logging.root.addHandler(handler)
 
     global __CONSOLE_CONFIGURED
+    global __LOGGING_CONSOLE_HANDLER
     __CONSOLE_CONFIGURED = True
+    __LOGGING_CONSOLE_HANDLER = handler
 
 
 def setup_logfile_logger(log_path, log_level='error', log_format=None,
-                         date_format=None):
+                         date_format=None, max_bytes=0, backup_count=0):
     '''
     Setup the logfile logger
 
@@ -521,11 +538,11 @@ def setup_logfile_logger(log_path, log_level='error', log_format=None,
     '''
 
     if is_logfile_configured():
-        logging.getLogger(__name__).warn('Logfile logging already configured')
+        logging.getLogger(__name__).warning('Logfile logging already configured')
         return
 
     if log_path is None:
-        logging.getLogger(__name__).warn(
+        logging.getLogger(__name__).warning(
             'log_path setting is set to `None`. Nothing else to do'
         )
         return
@@ -619,12 +636,33 @@ def setup_logfile_logger(log_path, log_level='error', log_format=None,
             shutdown_multiprocessing_logging_listener()
             sys.exit(2)
     else:
+        # make sure, the logging directory exists and attempt to create it if necessary
+        log_dir = os.path.dirname(log_path)
+        if not os.path.exists(log_dir):
+            logging.getLogger(__name__).info(
+                'Log directory not found, trying to create it: {0}'.format(log_dir)
+            )
+            try:
+                os.makedirs(log_dir, mode=0o700)
+            except OSError as ose:
+                logging.getLogger(__name__).warning(
+                    'Failed to create directory for log file: {0} ({1})'.format(log_dir, ose)
+                )
+                return
         try:
             # Logfile logging is UTF-8 on purpose.
             # Since salt uses YAML and YAML uses either UTF-8 or UTF-16, if a
             # user is not using plain ASCII, their system should be ready to
             # handle UTF-8.
-            handler = WatchedFileHandler(log_path, mode='a', encoding='utf-8', delay=0)
+            if max_bytes > 0:
+                handler = RotatingFileHandler(log_path,
+                                              mode='a',
+                                              maxBytes=max_bytes,
+                                              backupCount=backup_count,
+                                              encoding='utf-8',
+                                              delay=0)
+            else:
+                handler = WatchedFileHandler(log_path, mode='a', encoding='utf-8', delay=0)
         except (IOError, OSError):
             logging.getLogger(__name__).warning(
                 'Failed to open log file, do you have permission to write to '
@@ -649,7 +687,9 @@ def setup_logfile_logger(log_path, log_level='error', log_format=None,
     root_logger.addHandler(handler)
 
     global __LOGFILE_CONFIGURED
+    global __LOGGING_LOGFILE_HANDLER
     __LOGFILE_CONFIGURED = True
+    __LOGGING_LOGFILE_HANDLER = handler
 
 
 def setup_extended_logging(opts):
@@ -733,60 +773,165 @@ def setup_extended_logging(opts):
     # Remove the temporary queue logging handler
     __remove_queue_logging_handler()
 
+    # Remove the temporary null logging handler (if it exists)
+    __remove_null_logging_handler()
+
     global __EXTERNAL_LOGGERS_CONFIGURED
     __EXTERNAL_LOGGERS_CONFIGURED = True
 
 
 def get_multiprocessing_logging_queue():
+    global __MP_LOGGING_QUEUE
+
+    if __MP_IN_MAINPROCESS is False:
+        # We're not in the MainProcess, return! No Queue shall be instantiated
+        return __MP_LOGGING_QUEUE
+
+    if __MP_LOGGING_QUEUE is None:
+        __MP_LOGGING_QUEUE = multiprocessing.Queue()
     return __MP_LOGGING_QUEUE
 
 
-def setup_multiprocessing_logging_listener(queue=None):
+def set_multiprocessing_logging_queue(queue):
     global __MP_LOGGING_QUEUE
-    if queue is not None:
+    if __MP_LOGGING_QUEUE is not queue:
         __MP_LOGGING_QUEUE = queue
-    else:
-        __MP_LOGGING_QUEUE = multiprocessing.Queue()
 
+
+def setup_multiprocessing_logging_listener(opts, queue=None):
     global __MP_LOGGING_QUEUE_PROCESS
+    global __MP_LOGGING_LISTENER_CONFIGURED
+
+    if __MP_IN_MAINPROCESS is False:
+        # We're not in the MainProcess, return! No logging listener setup shall happen
+        return
+
+    if __MP_LOGGING_LISTENER_CONFIGURED is True:
+        return
+
     __MP_LOGGING_QUEUE_PROCESS = multiprocessing.Process(
         target=__process_multiprocessing_logging_queue,
-        args=(__MP_LOGGING_QUEUE,)
+        args=(opts, queue or get_multiprocessing_logging_queue(),)
     )
+    __MP_LOGGING_QUEUE_PROCESS.daemon = True
     __MP_LOGGING_QUEUE_PROCESS.start()
-
-    global __MP_LOGGING_LISTENER_CONFIGURED
     __MP_LOGGING_LISTENER_CONFIGURED = True
 
 
-def setup_multiprocessing_logging(queue):
+def setup_multiprocessing_logging(queue=None):
     '''
     This code should be called from within a running multiprocessing
     process instance.
     '''
-    global __MP_LOGGING_CONFIGURED
+    from salt.utils import is_windows
 
-    if __MP_LOGGING_CONFIGURED is True:
+    global __MP_LOGGING_CONFIGURED
+    global __MP_LOGGING_QUEUE_HANDLER
+
+    if __MP_IN_MAINPROCESS is True and not is_windows():
+        # We're in the MainProcess, return! No multiprocessing logging setup shall happen
+        # Windows is the exception where we want to set up multiprocessing
+        # logging in the MainProcess.
         return
 
-    # Let's set it to true as fast as possible
-    __MP_LOGGING_CONFIGURED = True
+    try:
+        logging._acquireLock()  # pylint: disable=protected-access
 
-    for handler in logging.root.handlers:
-        if isinstance(handler, SaltLogQueueHandler):
+        if __MP_LOGGING_CONFIGURED is True:
             return
 
-    # Let's add a queue handler to the logging root handlers
-    logging.root.addHandler(SaltLogQueueHandler(queue))
-    # Set the logging root level to the lowest to get all messages
-    logging.root.setLevel(logging.GARBAGE)
-    logging.getLogger(__name__).debug(
-        'Multiprocessing queue logging configured for the process running '
-        'under PID: {0}'.format(os.getpid())
-    )
+        # Let's set it to true as fast as possible
+        __MP_LOGGING_CONFIGURED = True
+
+        if __MP_LOGGING_QUEUE_HANDLER is not None:
+            return
+
+        # The temp null and temp queue logging handlers will store messages.
+        # Since noone will process them, memory usage will grow. If they
+        # exist, remove them.
+        __remove_null_logging_handler()
+        __remove_queue_logging_handler()
+
+        # Let's add a queue handler to the logging root handlers
+        __MP_LOGGING_QUEUE_HANDLER = SaltLogQueueHandler(queue or get_multiprocessing_logging_queue())
+        logging.root.addHandler(__MP_LOGGING_QUEUE_HANDLER)
+        # Set the logging root level to the lowest to get all messages
+        logging.root.setLevel(logging.GARBAGE)
+        logging.getLogger(__name__).debug(
+            'Multiprocessing queue logging configured for the process running '
+            'under PID: {0}'.format(os.getpid())
+        )
+        # The above logging call will create, in some situations, a futex wait
+        # lock condition, probably due to the multiprocessing Queue's internal
+        # lock and semaphore mechanisms.
+        # A small sleep will allow us not to hit that futex wait lock condition.
+        time.sleep(0.0001)
+    finally:
+        logging._releaseLock()  # pylint: disable=protected-access
 
 
-def shutdown_multiprocessing_logging_listener():
+def shutdown_console_logging():
+    global __CONSOLE_CONFIGURED
+    global __LOGGING_CONSOLE_HANDLER
+
+    if not __CONSOLE_CONFIGURED or not __LOGGING_CONSOLE_HANDLER:
+        return
+
+    try:
+        logging._acquireLock()
+        logging.root.removeHandler(__LOGGING_CONSOLE_HANDLER)
+        __LOGGING_CONSOLE_HANDLER = None
+        __CONSOLE_CONFIGURED = False
+    finally:
+        logging._releaseLock()
+
+
+def shutdown_logfile_logging():
+    global __LOGFILE_CONFIGURED
+    global __LOGGING_LOGFILE_HANDLER
+
+    if not __LOGFILE_CONFIGURED or not __LOGGING_LOGFILE_HANDLER:
+        return
+
+    try:
+        logging._acquireLock()
+        logging.root.removeHandler(__LOGGING_LOGFILE_HANDLER)
+        __LOGGING_LOGFILE_HANDLER = None
+        __LOGFILE_CONFIGURED = False
+    finally:
+        logging._releaseLock()
+
+
+def shutdown_temp_logging():
+    __remove_temp_logging_handler()
+
+
+def shutdown_multiprocessing_logging():
+    global __MP_LOGGING_CONFIGURED
+    global __MP_LOGGING_QUEUE_HANDLER
+
+    if not __MP_LOGGING_CONFIGURED or not __MP_LOGGING_QUEUE_HANDLER:
+        return
+
+    try:
+        logging._acquireLock()
+        # Let's remove the queue handler from the logging root handlers
+        logging.root.removeHandler(__MP_LOGGING_QUEUE_HANDLER)
+        __MP_LOGGING_QUEUE_HANDLER = None
+        __MP_LOGGING_CONFIGURED = False
+    finally:
+        logging._releaseLock()
+
+
+def shutdown_multiprocessing_logging_listener(daemonizing=False):
+    global __MP_LOGGING_QUEUE
+    global __MP_LOGGING_QUEUE_PROCESS
+    global __MP_LOGGING_LISTENER_CONFIGURED
+
+    if daemonizing is False and __MP_IN_MAINPROCESS is True:
+        # We're in the MainProcess and we're not daemonizing, return!
+        # No multiprocessing logging listener shutdown shall happen
+        return
     if __MP_LOGGING_QUEUE_PROCESS is None:
         return
     if __MP_LOGGING_QUEUE_PROCESS.is_alive():
@@ -795,7 +940,14 @@ def shutdown_multiprocessing_logging_listener():
             # Sent None sentinel to stop the logging processing queue
             __MP_LOGGING_QUEUE.put(None)
             # Let's join the multiprocessing logging handle thread
+            time.sleep(0.5)
+            logging.getLogger(__name__).debug('closing multiprocessing queue')
+            __MP_LOGGING_QUEUE.close()
+            logging.getLogger(__name__).debug('joining multiprocessing queue thread')
+            __MP_LOGGING_QUEUE.join_thread()
+            __MP_LOGGING_QUEUE = None
             __MP_LOGGING_QUEUE_PROCESS.join(1)
+            __MP_LOGGING_QUEUE = None
         except IOError:
             # We were unable to deliver the sentinel to the queue
             # carry on...
@@ -803,6 +955,8 @@ def shutdown_multiprocessing_logging_listener():
         if __MP_LOGGING_QUEUE_PROCESS.is_alive():
             # Process is still alive!?
             __MP_LOGGING_QUEUE_PROCESS.terminate()
+        __MP_LOGGING_QUEUE_PROCESS = None
+        __MP_LOGGING_LISTENER_CONFIGURED = False
         logging.getLogger(__name__).debug('Stopped the multiprocessing logging queue listener')
 
 
@@ -823,11 +977,40 @@ def patch_python_logging_handlers():
     logging.FileHandler = FileHandler
     logging.handlers.SysLogHandler = SysLogHandler
     logging.handlers.WatchedFileHandler = WatchedFileHandler
+    logging.handlers.RotatingFileHandler = RotatingFileHandler
     if sys.version_info >= (3, 2):
         logging.handlers.QueueHandler = QueueHandler
 
 
-def __process_multiprocessing_logging_queue(queue):
+def __process_multiprocessing_logging_queue(opts, queue):
+    import salt.utils
+    salt.utils.appendproctitle('MultiprocessingLoggingQueue')
+
+    # Assign UID/GID of user to proc if set
+    from salt.utils.verify import check_user
+    user = opts.get('user')
+    if user:
+        check_user(user)
+
+    if salt.utils.is_windows():
+        # On Windows, creating a new process doesn't fork (copy the parent
+        # process image). Due to this, we need to setup all of our logging
+        # inside this process.
+        setup_temp_logger()
+        setup_console_logger(
+            log_level=opts.get('log_level'),
+            log_format=opts.get('log_fmt_console'),
+            date_format=opts.get('log_datefmt_console')
+        )
+        setup_logfile_logger(
+            opts.get('log_file'),
+            log_level=opts.get('log_level_logfile'),
+            log_format=opts.get('log_fmt_logfile'),
+            date_format=opts.get('log_datefmt_logfile'),
+            max_bytes=opts.get('log_rotate_max_bytes', 0),
+            backup_count=opts.get('log_rotate_backup_count', 0)
+        )
+        setup_extended_logging(opts)
     while True:
         try:
             record = queue.get()
@@ -841,7 +1024,7 @@ def __process_multiprocessing_logging_queue(queue):
         except (EOFError, KeyboardInterrupt, SystemExit):
             break
         except Exception as exc:  # pylint: disable=broad-except
-            logging.getLogger(__name__).warn(
+            logging.getLogger(__name__).warning(
                 'An exception occurred in the multiprocessing logging '
                 'queue thread: {0}'.format(exc),
                 exc_info_on_loglevel=logging.DEBUG
@@ -853,12 +1036,12 @@ def __remove_null_logging_handler():
     This function will run once the temporary logging has been configured. It
     just removes the NullHandler from the logging handlers.
     '''
-    if is_temp_logging_configured():
-        # In this case, the NullHandler has been removed, return!
+    global LOGGING_NULL_HANDLER
+    if LOGGING_NULL_HANDLER is None:
+        # Already removed
         return
 
     root_logger = logging.getLogger()
-    global LOGGING_NULL_HANDLER
 
     for handler in root_logger.handlers:
         if handler is LOGGING_NULL_HANDLER:
@@ -873,8 +1056,12 @@ def __remove_queue_logging_handler():
     This function will run once the additional loggers have been synchronized.
     It just removes the QueueLoggingHandler from the logging handlers.
     '''
-    root_logger = logging.getLogger()
     global LOGGING_STORE_HANDLER
+    if LOGGING_STORE_HANDLER is None:
+        # Already removed
+        return
+
+    root_logger = logging.getLogger()
 
     for handler in root_logger.handlers:
         if handler is LOGGING_STORE_HANDLER:

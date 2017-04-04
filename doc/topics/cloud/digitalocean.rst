@@ -45,13 +45,14 @@ Set up an initial profile at ``/etc/salt/cloud.profiles`` or in the
 .. code-block:: yaml
 
     digitalocean-ubuntu:
-        provider: my-digitalocean-config
-        image: 14.04 x64
-        size: 512MB
-        location: New York 1
-        private_networking: True
-        backups_enabled: True
-        ipv6: True
+      provider: my-digitalocean-config
+      image: 14.04 x64
+      size: 512MB
+      location: New York 1
+      private_networking: True
+      backups_enabled: True
+      ipv6: True
+      create_dns_record: True
 
 Locations can be obtained using the ``--list-locations`` option for the ``salt-cloud``
 command:
@@ -133,6 +134,28 @@ command:
                     True
     ...SNIP...
 
+
+Profile Specifics:
+------------------
+
+ssh_username
+------------
+
+If using a FreeBSD image from Digital Ocean, you'll need to set the ``ssh_username``
+setting to ``freebsd`` in your profile configuration.
+
+.. code-block:: yaml
+
+    digitalocean-freebsd:
+      provider: my-digitalocean-config
+      image: 10.2
+      size: 512MB
+      ssh_username: freebsd
+
+
+Miscellaneous Information
+=========================
+
 .. note::
 
     DigitalOcean's concept of ``Applications`` is nothing more than a
@@ -144,10 +167,24 @@ command:
 
 .. note::
 
-    If your domain's DNS is managed with DigitalOcean, you can automatically
-    create A-records for newly created droplets. Use ``create_dns_record: True``
-    in your config to enable this. Add ``delete_dns_record: True`` to also
-    delete records when a droplet is destroyed.
+    If your domain's DNS is managed with DigitalOcean, and your minion name
+    matches your DigitalOcean managed DNS domain, you can automatically create
+    A and AAA records for newly created droplets. Use ``create_dns_record: True``
+    in your config to enable this. Adding ``delete_dns_record: True`` to also
+    delete records when a droplet is destroyed is optional. Due to limitations
+    in salt-cloud design, the destroy code does not have access to the VM config
+    data. WHETHER YOU ADD ``create_dns_record: True`` OR NOT, salt-cloud WILL
+    attempt to delete your DNS records if the minion name matches. This will
+    prevent advertising any recycled IP addresses for destroyed minions.
+
+.. note::
+
+   If you need to perform the bootstrap using the local interface for droplets,
+   this can be done by setting ``ssh_interface: private`` in your config. By
+   default the salt-cloud script would run on the public interface however if firewall
+   is preventing the connection to the Droplet over the public interface you might need
+   to set this option to connect via private interface. Also, to use this feature
+   ``private_networking: True`` must be set in the config.
 
 .. note::
 

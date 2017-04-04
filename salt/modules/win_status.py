@@ -12,46 +12,62 @@ or for problem solving if your minion is having problems.
 
 # Import Python Libs
 from __future__ import absolute_import
+import os
+import ctypes
+import sys
+import time
+import datetime
 import logging
+
+log = logging.getLogger(__name__)
 
 # Import Salt Libs
 import salt.utils
 import salt.ext.six as six
 import salt.utils.event
 from salt._compat import subprocess
-from salt.utils.network import host_to_ip as _host_to_ip
+from salt.utils.network import host_to_ips as _host_to_ips
+# pylint: disable=W0611
+from salt.modules.status import ping_master, time_
+import copy
+# pylint: enable=W0611
+from salt.utils import namespaced_function as _namespaced_function
 
-import os
-import ctypes
-import sys
-import time
-from subprocess import list2cmdline
-
-log = logging.getLogger(__name__)
-
+# Import 3rd Party Libs
 try:
-    import wmi
-    import salt.utils.winapi
-    has_required_packages = True
-except ImportError:
     if salt.utils.is_windows():
-        log.exception('pywin32 and wmi python packages are required '
-                      'in order to use the status module.')
-    has_required_packages = False
+        import wmi
+        import salt.utils.winapi
+        HAS_WMI = True
+    else:
+        HAS_WMI = False
+except ImportError:
+    HAS_WMI = False
 
 __opts__ = {}
-
-# Define the module's virtual name
 __virtualname__ = 'status'
 
 
 def __virtual__():
     '''
-    Only works on Windows systems
+    Only works on Windows systems with WMI and WinAPI
     '''
-    if salt.utils.is_windows() and has_required_packages:
-        return __virtualname__
-    return False
+    if not salt.utils.is_windows():
+        return False, 'win_status.py: Requires Windows'
+
+    if not HAS_WMI:
+        return False, 'win_status.py: Requires WMI and WinAPI'
+
+    # Namespace modules from `status.py`
+    global ping_master, time_
+    ping_master = _namespaced_function(ping_master, globals())
+    time_ = _namespaced_function(time_, globals())
+
+    return __virtualname__
+
+__func_alias__ = {
+    'time_': 'time'
+}
 
 
 def cpuload():
@@ -64,21 +80,12 @@ def cpuload():
 
     .. code-block:: bash
 
-       salt '*' status.cpu_load
+       salt '*' status.cpuload
     '''
 
     # Pull in the information from WMIC
-    cmd = list2cmdline(['wmic', 'cpu'])
-    info = __salt__['cmd.run'](cmd).split('\r\n')
-
-    # Find the location of LoadPercentage
-    column = info[0].index('LoadPercentage')
-
-    # Get the end of the number.
-    end = info[1].index(' ', column+1)
-
-    # Return pull it out of the informatin and cast it to an int
-    return int(info[1][column:end])
+    cmd = ['wmic', 'cpu', 'get', 'loadpercentage', '/value']
+    return int(__salt__['cmd.run'](cmd).split('=')[1])
 
 
 def diskusage(human_readable=False, path=None):
@@ -94,7 +101,7 @@ def diskusage(human_readable=False, path=None):
 
     .. code-block:: bash
 
-        salt '*' status.disk_usage path=c:/salt
+        salt '*' status.diskusage path=c:/salt
     '''
     if not path:
         path = 'c:/'
@@ -163,14 +170,14 @@ def saltmem(human_readable=False):
     Returns the amount of memory that salt is using
 
     human_readable : False
-        return the value in a nicely formated number
+        return the value in a nicely formatted number
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' status.salt_mem
-        salt '*' status.salt_mem human_readable=True
+        salt '*' status.saltmem
+        salt '*' status.saltmem human_readable=True
     '''
     with salt.utils.winapi.Com():
         wmi_obj = wmi.WMI()
@@ -191,8 +198,7 @@ def uptime(human_readable=False):
     Return the system uptime for this machine in seconds
 
     human_readable : False
-        If ``True``, then the number of seconds will be translated into years,
-        months, days, etc.
+        If ``True``, then return uptime in years, days, and seconds.
 
     CLI Example:
 
@@ -203,53 +209,18 @@ def uptime(human_readable=False):
     '''
 
     # Open up a subprocess to get information from WMIC
-    cmd = list2cmdline(['net', 'stats', 'srv'])
-    outs = __salt__['cmd.run'](cmd)
+    cmd = ['wmic', 'os', 'get', 'lastbootuptime', '/value']
+    startup_time = __salt__['cmd.run'](cmd).split('=')[1][:14]
 
-    # Get the line that has when the computer started in it:
-    stats_line = ''
-    for line in outs.split('\r\n'):
-        if "Statistics since" in line:
-            stats_line = line
-
-    # Extract the time string from the line and parse
-    #
-    # Get string
-    startup_time = stats_line[len('Statistics Since '):]
-    # Convert to struct
-    startup_time = time.strptime(startup_time, '%d/%m/%Y %H:%M:%S')
-    # eonvert to seconds since epoch
-    startup_time = time.mktime(startup_time)
+    # Convert to time struct
+    startup_time = time.strptime(startup_time, '%Y%m%d%H%M%S')
+    # Convert to datetime object
+    startup_time = datetime.datetime(*startup_time[:6])
 
     # Subtract startup time from current time to get the uptime of the system
-    uptime = time.time() - startup_time
+    uptime = datetime.datetime.now() - startup_time
 
-    if human_readable:
-        # Pull out the majority of the uptime tuple. h:m:s
-        uptime = int(uptime)
-        seconds = uptime % 60
-        uptime /= 60
-        minutes = uptime % 60
-        uptime /= 60
-        hours = uptime % 24
-        uptime /= 24
-
-        # Translate the h:m:s from above into HH:MM:SS format.
-        ret = '{0:0>2}:{1:0>2}:{2:0>2}'.format(hours, minutes, seconds)
-
-        # If the minion has been on for days, add that in.
-        if uptime > 0:
-            ret = 'Days: {0} {1}'.format(uptime % 365, ret)
-
-        # If you have a Windows minion that has been up for years,
-        # my hat is off to you sir.
-        if uptime > 365:
-            ret = 'Years: {0} {1}'.format(uptime / 365, ret)
-
-        return ret
-
-    else:
-        return uptime
+    return str(uptime) if human_readable else uptime.total_seconds()
 
 
 def _get_process_info(proc):
@@ -357,30 +328,32 @@ def master(master=None, connected=True):
 
     # the default publishing port
     port = 4505
-    master_ip = None
+    master_ips = None
+
+    if master:
+        master_ips = _host_to_ips(master)
+
+    if not master_ips:
+        return
 
     if __salt__['config.get']('publish_port') != '':
         port = int(__salt__['config.get']('publish_port'))
 
-    # Check if we have FQDN/hostname defined as master
-    # address and try resolving it first. _remote_port_tcp
-    # only works with IP-addresses.
-    if master is not None:
-        tmp_ip = _host_to_ip(master)
-        if tmp_ip is not None:
-            master_ip = tmp_ip
+    master_connection_status = False
+    connected_ips = _win_remotes_on(port)
 
-    ips = _win_remotes_on(port)
+    # Get connection status for master
+    for master_ip in master_ips:
+        if master_ip in connected_ips:
+            master_connection_status = True
+            break
 
-    if connected:
-        if master_ip not in ips:
-            event = salt.utils.event.get_event(
-                'minion', opts=__opts__, listen=False
-            )
-            event.fire_event({'master': master}, '__master_disconnected')
-    else:
-        if master_ip in ips:
-            event = salt.utils.event.get_event(
-                'minion', opts=__opts__, listen=False
-            )
-            event.fire_event({'master': master}, '__master_connected')
+    # Connection to master is not as expected
+    if master_connection_status is not connected:
+        event = salt.utils.event.get_event('minion', opts=__opts__, listen=False)
+        if master_connection_status:
+            event.fire_event({'master': master}, salt.minion.master_event(type='connected'))
+        else:
+            event.fire_event({'master': master}, salt.minion.master_event(type='disconnected'))
+
+    return master_connection_status

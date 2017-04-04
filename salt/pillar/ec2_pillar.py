@@ -31,12 +31,15 @@ the instance.
 from __future__ import absolute_import
 import re
 import logging
-from distutils.version import StrictVersion  # pylint: disable=no-name-in-module
+
+# Import salt libs
+from salt.utils.versions import StrictVersion as _StrictVersion
 
 # Import AWS Boto libs
 try:
     import boto.ec2
     import boto.utils
+    import boto.exception
     HAS_BOTO = True
 except ImportError:
     HAS_BOTO = False
@@ -52,8 +55,8 @@ def __virtual__():
     '''
     if not HAS_BOTO:
         return False
-    boto_version = StrictVersion(boto.__version__)
-    required_boto_version = StrictVersion('2.8.0')
+    boto_version = _StrictVersion(boto.__version__)
+    required_boto_version = _StrictVersion('2.8.0')
     if boto_version < required_boto_version:
         log.error("%s: installed boto version %s < %s, can't retrieve instance data",
                 __name__, boto_version, required_boto_version)
@@ -84,7 +87,7 @@ def ext_pillar(minion_id,
     # if there is a grain named 'instance-id' use that.  Because this is a
     # security risk, the master config must contain a use_grain: True option
     # for this external pillar, which defaults to no
-    if re.search(r'^i-[0-9a-z]{8}$', minion_id) is None:
+    if re.search(r'^i-([0-9a-z]{17}|[0-9a-z]{8})$', minion_id) is None:
         if 'instance-id' not in __grains__:
             log.debug("Minion-id is not in AWS instance-id formation, and there "
                       "is no instance-id grain for minion {0}".format(minion_id))
@@ -103,7 +106,7 @@ def ext_pillar(minion_id,
                       "not in the list of allowed minions {1}".format(minion_id,
                       minion_ids))
             return {}
-        if re.search(r'^i-[0-9a-z]{8}$', __grains__['instance-id']) is not None:
+        if re.search(r'^i-([0-9a-z]{17}|[0-9a-z]{8})$', __grains__['instance-id']) is not None:
             minion_id = __grains__['instance-id']
             log.debug("Minion-id is not in AWS instance ID format, but a grain"
                       " is, so using {0} as the minion ID".format(minion_id))
@@ -123,7 +126,7 @@ def ext_pillar(minion_id,
 
     try:
         conn = boto.ec2.connect_to_region(region)
-    except boto.exception as e:
+    except boto.exception as e:  # pylint: disable=E0712
         log.error("%s: invalid AWS credentials.", __name__)
         return None
 

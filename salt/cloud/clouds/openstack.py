@@ -27,7 +27,9 @@ Set up in the cloud configuration at ``/etc/salt/cloud.providers`` or
 
     my-openstack-config:
       # The OpenStack identity service url
-      identity_url: https://region-b.geo-1.identity.hpcloudsvc.com:35357/v2.0/
+      identity_url: https://region-b.geo-1.identity.hpcloudsvc.com:35357/v2.0/tokens
+      # The OpenStack Identity Version (default: 2)
+      auth_version: 2
       # The OpenStack compute region
       compute_region: region-b.geo-1
       # The OpenStack compute service name
@@ -66,6 +68,22 @@ For in-house Openstack Essex installation, libcloud needs the service_type :
     identity_url: 'http://control.openstack.example.org:5000/v2.0/'
     compute_name : Compute Service
     service_type : compute
+
+To use identity v3 for authentication, specify the `domain` and `auth_version`
+
+.. code-block:: yaml
+
+    my-openstack-config:
+      identity_url: 'http://control.openstack.example.org:5000/v3/auth/tokens'
+      auth_version: 3
+      compute_name : Compute Service
+      compute_region: East
+      service_type : compute
+      tenant: tenant
+      domain: testing
+      user: daniel
+      password: securepassword
+      driver: openstack
 
 
 Either a password or an API key must also be specified:
@@ -138,6 +156,9 @@ HAS014 = False
 try:
     from libcloud.compute.drivers.openstack import OpenStackNetwork
     from libcloud.compute.drivers.openstack import OpenStack_1_1_FloatingIpPool
+    # See https://github.com/saltstack/salt/issues/32743
+    import libcloud.security
+    libcloud.security.CA_CERTS_PATH.append('/etc/ssl/certs/YaST-CA.pem')
     HAS014 = True
 except Exception:
     pass
@@ -204,9 +225,9 @@ def __virtual__():
         return False
 
     salt.utils.warn_until(
-        'Carbon',
+        'Oxygen',
         'This driver has been deprecated and will be removed in the '
-        'Carbon release of Salt. Please use the nova driver instead.'
+        '{version} release of Salt. Please use the nova driver instead.'
     )
 
     return __virtualname__
@@ -256,6 +277,9 @@ def get_conn():
         'ex_tenant_name': config.get_cloud_config_value(
             'tenant', vm_, __opts__, search_global=False
         ),
+        'ex_domain_name': config.get_cloud_config_value(
+            'domain', vm_, __opts__, default='Default', search_global=False
+        ),
     }
 
     service_type = config.get_cloud_config_value('service_type',
@@ -288,7 +312,10 @@ def get_conn():
     )
 
     if password is not None:
-        authinfo['ex_force_auth_version'] = '2.0_password'
+        if config.get_cloud_config_value('auth_version', vm_, __opts__, search_global=False) == 3:
+            authinfo['ex_force_auth_version'] = '3.x_password'
+        else:
+            authinfo['ex_force_auth_version'] = '2.0_password'
         log.debug('OpenStack authenticating using password')
         if password == 'USE_KEYRING':
             # retrieve password from system keyring
@@ -512,14 +539,21 @@ def request_instance(vm_=None, call=None):
     if config_drive is not None:
         kwargs['ex_config_drive'] = config_drive
 
-    salt.utils.cloud.fire_event(
+    event_kwargs = {
+        'name': kwargs['name'],
+        'image': kwargs['image'].name,
+        'size': kwargs['size'].name,
+        'profile': vm_['profile'],
+    }
+
+    __utils__['cloud.fire_event'](
         'event',
         'requesting instance',
         'salt/cloud/{0}/requesting'.format(vm_['name']),
-        {'kwargs': {'name': kwargs['name'],
-                    'image': kwargs['image'].name,
-                    'size': kwargs['size'].name,
-                    'profile': vm_['profile']}},
+        args={
+            'kwargs': __utils__['cloud.filter_event']('requesting', event_kwargs, event_kwargs.keys()),
+        },
+        sock_dir=__opts__['sock_dir'],
         transport=__opts__['transport']
     )
 
@@ -556,15 +590,11 @@ def create(vm_):
         # Check for required profile parameters before sending any API calls.
         if vm_['profile'] and config.is_profile_configured(__opts__,
                                                            __active_provider_name__ or 'openstack',
-                                                           vm_['profile']) is False:
+                                                           vm_['profile'],
+                                                           vm_=vm_) is False:
             return False
     except AttributeError:
         pass
-
-    # Since using "provider: <provider-engine>" is deprecated, alias provider
-    # to use driver: "driver: <provider-engine>"
-    if 'provider' in vm_:
-        vm_['driver'] = vm_.pop('provider')
 
     deploy = config.get_cloud_config_value('deploy', vm_, __opts__)
     key_filename = config.get_cloud_config_value(
@@ -581,15 +611,12 @@ def create(vm_):
 
     vm_['key_filename'] = key_filename
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'starting create',
         'salt/cloud/{0}/creating'.format(vm_['name']),
-        {
-            'name': vm_['name'],
-            'profile': vm_['profile'],
-            'provider': vm_['driver'],
-        },
+        args=__utils__['cloud.filter_event']('creating', vm_, ['name', 'profile', 'provider', 'driver']),
+        sock_dir=__opts__['sock_dir'],
         transport=__opts__['transport']
     )
 
@@ -687,22 +714,24 @@ def create(vm_):
         result = []
         private = node['private_ips']
         if private and not public:
-            log.warn(
+            log.warning(
                 'Private IPs returned, but not public... Checking for '
                 'misidentified IPs'
             )
             for private_ip in private:
                 private_ip = preferred_ip(vm_, [private_ip])
+                if private_ip is False:
+                    continue
                 if salt.utils.cloud.is_public_ip(private_ip):
-                    log.warn('{0} is a public IP'.format(private_ip))
+                    log.warning('{0} is a public IP'.format(private_ip))
                     data.public_ips.append(private_ip)
-                    log.warn(
+                    log.warning(
                         'Public IP address was not ready when we last checked.'
                         ' Appending public IP address now.'
                     )
                     public = data.public_ips
                 else:
-                    log.warn('{0} is a private IP'.format(private_ip))
+                    log.warning('{0} is a private IP'.format(private_ip))
                     ignore_ip = ignore_cidr(vm_, private_ip)
                     if private_ip not in data.private_ips and not ignore_ip:
                         result.append(private_ip)
@@ -770,7 +799,7 @@ def create(vm_):
 
     vm_['salt_host'] = salt_ip_address
     vm_['ssh_host'] = ip_address
-    ret = salt.utils.cloud.bootstrap(vm_, __opts__)
+    ret = __utils__['cloud.bootstrap'](vm_, __opts__)
     ret.update(data.__dict__)
 
     if hasattr(data, 'extra') and 'password' in data.extra:
@@ -783,15 +812,12 @@ def create(vm_):
         )
     )
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'created instance',
         'salt/cloud/{0}/created'.format(vm_['name']),
-        {
-            'name': vm_['name'],
-            'profile': vm_['profile'],
-            'provider': vm_['driver'],
-        },
+        args=__utils__['cloud.filter_event']('created', vm_, ['name', 'profile', 'provider', 'driver']),
+        sock_dir=__opts__['sock_dir'],
         transport=__opts__['transport']
     )
 
@@ -816,19 +842,18 @@ def _assign_floating_ips(vm_, conn, kwargs):
                     pool = OpenStack_1_1_FloatingIpPool(
                         net['floating'], conn.connection
                     )
-                    for idx in [pool.create_floating_ip()]:
+                    for idx in pool.list_floating_ips():
                         if idx.node_id is None:
                             floating.append(idx)
                     if not floating:
-                        # Note(pabelanger): We have no available floating IPs.
-                        # For now, we raise an exception and exit.
-                        # A future enhancement might be to allow salt-cloud
-                        # to dynamically allocate new address but that might
-                        raise SaltCloudSystemExit(
-                            'Floating pool \'{0}\' does not have any more '
-                            'please create some more or use a different '
-                            'pool.'.format(net['floating'])
-                        )
+                        try:
+                            floating.append(pool.create_floating_ip())
+                        except Exception as e:
+                            raise SaltCloudSystemExit(
+                                'Floating pool \'{0}\' does not have any more '
+                                'please create some more or use a different '
+                                'pool.'.format(net['floating'])
+                            )
         # otherwise, attempt to obtain list without specifying pool
         # this is the same as 'nova floating-ip-list'
         elif ssh_interface(vm_) != 'private_ips':
@@ -840,19 +865,17 @@ def _assign_floating_ips(vm_, conn, kwargs):
                 pool = OpenStack_1_1_FloatingIpPool(
                     '', conn.connection
                 )
-                for idx in [pool.create_floating_ip()]:
+                for idx in pool.list_floating_ips():
                     if idx.node_id is None:
                         floating.append(idx)
                 if not floating:
-                    # Note(pabelanger): We have no available floating IPs.
-                    # For now, we raise an exception and exit.
-                    # A future enhancement might be to allow salt-cloud to
-                    # dynamically allocate new address but that might be
-                    # tricky to manage.
-                    raise SaltCloudSystemExit(
-                        'There are no more floating IP addresses '
-                        'available, please create some more'
-                    )
+                    try:
+                        floating.append(pool.create_floating_ip())
+                    except Exception as e:
+                        raise SaltCloudSystemExit(
+                            'There are no more floating IP addresses '
+                            'available, please create some more'
+                        )
             except Exception as e:
                 if str(e).startswith('404'):
                     pass

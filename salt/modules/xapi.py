@@ -67,7 +67,7 @@ def _check_xenapi():
 def __virtual__():
     if _check_xenapi() is not False:
         return __virtualname__
-    return False
+    return (False, "Module xapi: xenapi check failed")
 
 
 @contextlib.contextmanager
@@ -773,9 +773,10 @@ def is_hyper():
         # virtual_subtype isn't set everywhere.
         return False
     try:
-        if 'xen_' not in salt.utils.fopen('/proc/modules').read():
-            return False
-    except IOError:
+        with salt.utils.fopen('/proc/modules') as fp_:
+            if 'xen_' not in fp_.read():
+                return False
+    except (OSError, IOError):
         return False
     # there must be a smarter way...
     return 'xenstore' in __salt__['cmd.run'](__grains__['ps'])
@@ -925,55 +926,3 @@ def vm_diskstats(vm_=None):
             for vm_ in list_domains():
                 info[vm_] = _info(vm_)
         return info
-
-
-# Deprecated aliases
-def create(domain):
-    '''
-    .. deprecated:: Boron
-       Use :py:func:`~salt.modules.virt.start` instead.
-
-    Start a defined domain
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' virt.create <domain>
-    '''
-    salt.utils.warn_until('Nitrogen', 'Use "virt.start" instead.')
-    return start(domain)
-
-
-def destroy(domain):
-    '''
-    .. deprecated:: Boron
-       Use :py:func:`~salt.modules.virt.stop` instead.
-
-    Power off a defined domain
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' virt.destroy <domain>
-    '''
-    salt.utils.warn_until('Nitrogen', 'Use "virt.stop" instead.')
-    return stop(domain)
-
-
-def list_vms():
-    '''
-    .. deprecated:: Boron
-       Use :py:func:`~salt.modules.virt.list_domains` instead.
-
-    List all virtual machines.
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' virt.list_vms <domain>
-    '''
-    salt.utils.warn_until('Nitrogen', 'Use "virt.list_domains" instead.')
-    return list_domains()

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+from __future__ import absolute_import
 import time
 import shutil
 import tempfile
@@ -7,12 +8,12 @@ import os
 
 from contextlib import contextmanager
 
-import integration
+import tests.integration as integration
 
 from salt.utils.process import clean_proc
 from salt.utils import event
 
-from salttesting.mock import patch
+from tests.support.mock import patch
 
 
 @contextmanager

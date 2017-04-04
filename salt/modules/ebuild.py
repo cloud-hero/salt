@@ -2,6 +2,12 @@
 '''
 Support for Portage
 
+.. important::
+    If you feel that Salt should be using this module to manage packages on a
+    minion, and it is using a different module (or gives an error similar to
+    *'pkg.install' is not available*), see :ref:`here
+    <module-provider-override>`.
+
 :optdepends:    - portage Python adapter
 
 For now all package names *MUST* include the package category,
@@ -16,6 +22,7 @@ import re
 
 # Import salt libs
 import salt.utils
+import salt.utils.systemd
 from salt.exceptions import CommandExecutionError, MinionError
 import salt.ext.six as six
 
@@ -48,17 +55,17 @@ def __virtual__():
     '''
     if HAS_PORTAGE and __grains__['os'] == 'Gentoo':
         return __virtualname__
-    return False
+    return (False, 'The ebuild execution module cannot be loaded: either the system is not Gentoo or the portage python library is not available.')
 
 
 def _vartree():
-    import portage
+    import portage  # pylint: disable=3rd-party-module-not-gated
     portage = reload(portage)
     return portage.db[portage.root]['vartree']
 
 
 def _porttree():
-    import portage
+    import portage  # pylint: disable=3rd-party-module-not-gated
     portage = reload(portage)
     return portage.db[portage.root]['porttree']
 
@@ -96,12 +103,11 @@ def _process_emerge_err(stdout, stderr):
     Used to parse emerge output to provide meaningful output when emerge fails
     '''
     ret = {}
-    changes = {}
     rexp = re.compile(r'^[<>=][^ ]+/[^ ]+ [^\n]+', re.M)
 
     slot_conflicts = re.compile(r'^[^ \n]+/[^ ]+:[^ ]', re.M).findall(stderr)
     if slot_conflicts:
-        changes['slot conflicts'] = slot_conflicts
+        ret['slot conflicts'] = slot_conflicts
 
     blocked = re.compile(r'(?m)^\[blocks .+\] '
                          r'([^ ]+/[^ ]+-[0-9]+[^ ]+)'
@@ -112,19 +118,18 @@ def _process_emerge_err(stdout, stderr):
 
     # If there were blocks and emerge could not resolve it.
     if blocked and unsatisfied:
-        changes['blocked'] = blocked
+        ret['blocked'] = blocked
 
     sections = re.split('\n\n', stderr)
     for section in sections:
         if 'The following keyword changes' in section:
-            changes['keywords'] = rexp.findall(section)
+            ret['keywords'] = rexp.findall(section)
         elif 'The following license changes' in section:
-            changes['license'] = rexp.findall(section)
+            ret['license'] = rexp.findall(section)
         elif 'The following USE changes' in section:
-            changes['use'] = rexp.findall(section)
+            ret['use'] = rexp.findall(section)
         elif 'The following mask changes' in section:
-            changes['mask'] = rexp.findall(section)
-    ret['changes'] = {'Needed changes': changes}
+            ret['mask'] = rexp.findall(section)
     return ret
 
 
@@ -228,7 +233,7 @@ def latest_version(*names, **kwargs):
         ret[name] = ''
         installed = _cpv_to_version(_vartree().dep_bestmatch(name))
         avail = _cpv_to_version(_porttree().dep_bestmatch(name))
-        if avail:
+        if avail and (not installed or salt.utils.compare_versions(ver1=installed, oper='<', ver2=avail, cmp_func=version_cmp)):
             ret[name] = avail
 
     # Return a string if only one package name passed
@@ -237,7 +242,7 @@ def latest_version(*names, **kwargs):
     return ret
 
 # available_version is being deprecated
-available_version = latest_version
+available_version = salt.utils.alias_function(latest_version, 'available_version')
 
 
 def _get_upgradable(backtrack=3):
@@ -262,14 +267,12 @@ def _get_upgradable(backtrack=3):
                                    python_shell=False)
 
     if call['retcode'] != 0:
-        comment = ''
-        if 'stderr' in call:
-            comment += call['stderr']
-        if 'stdout' in call:
-            comment += call['stdout']
-        raise CommandExecutionError(
-            '{0}'.format(comment)
-        )
+        msg = 'Failed to get upgrades'
+        for key in ('stderr', 'stdout'):
+            if call[key]:
+                msg += ': ' + call[key]
+                break
+        raise CommandExecutionError(msg)
     else:
         out = call['stdout']
 
@@ -292,7 +295,7 @@ def _get_upgradable(backtrack=3):
     return ret
 
 
-def list_upgrades(refresh=True, backtrack=3):
+def list_upgrades(refresh=True, backtrack=3, **kwargs):  # pylint: disable=W0613
     '''
     List all available package upgrades.
 
@@ -460,6 +463,20 @@ def install(name=None,
             binhost=None,
             **kwargs):
     '''
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands which modify installed packages from the
+        ``salt-minion`` daemon's control group. This is done to keep systemd
+        from killing any emerge commands spawned by Salt when the
+        ``salt-minion`` service is restarted. (see ``KillMode`` in the
+        `systemd.kill(5)`_ manpage for more information). If desired, usage of
+        `systemd-run(1)`_ can be suppressed by setting a :mod:`config option
+        <salt.modules.config.get>` called ``systemd.scope``, with a value of
+        ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+    .. _`systemd.kill(5)`: https://www.freedesktop.org/software/systemd/man/systemd.kill.html
+
     Install the passed package(s), add refresh=True to sync the portage tree
     before package is installed.
 
@@ -581,7 +598,7 @@ def install(name=None,
             if fromrepo is not None:
                 version_num += '::{0}'.format(fromrepo)
             if uses is not None:
-                version_num += '["{0}"]'.format('","'.join(uses))
+                version_num += '[{0}]'.format(','.join(uses))
             pkg_params = {name: version_num}
 
     if pkg_params is None or len(pkg_params) == 0:
@@ -618,44 +635,49 @@ def install(name=None,
                     keyword, gt_lt, eq, verstr = match.groups()
                     prefix = gt_lt or ''
                     prefix += eq or ''
-                    # We need to delete quotes around use flag list elements
-                    verstr = verstr.replace("'", "")
                     # If no prefix characters were supplied and verstr contains a version, use '='
                     if len(verstr) > 0 and verstr[0] != ':' and verstr[0] != '[':
                         prefix = prefix or '='
-                        target = '"{0}{1}-{2}"'.format(prefix, param, verstr)
+                        target = '{0}{1}-{2}'.format(prefix, param, verstr)
                     else:
-                        target = '"{0}{1}"'.format(param, verstr)
+                        target = '{0}{1}'.format(param, verstr)
                 else:
-                    target = '"{0}"'.format(param)
+                    target = '{0}'.format(param)
 
                 if '[' in target:
-                    old = __salt__['portage_config.get_flags_from_package_conf']('use', target[1:-1])
-                    __salt__['portage_config.append_use_flags'](target[1:-1])
-                    new = __salt__['portage_config.get_flags_from_package_conf']('use', target[1:-1])
+                    old = __salt__['portage_config.get_flags_from_package_conf']('use', target)
+                    __salt__['portage_config.append_use_flags'](target)
+                    new = __salt__['portage_config.get_flags_from_package_conf']('use', target)
                     if old != new:
                         changes[param + '-USE'] = {'old': old, 'new': new}
-                    target = target[:target.rfind('[')] + '"'
+                    target = target[:target.rfind('[')]
 
                 if keyword is not None:
                     __salt__['portage_config.append_to_package_conf']('accept_keywords',
-                                                                        target[1:-1],
+                                                                        target,
                                                                         ['~ARCH'])
                     changes[param + '-ACCEPT_KEYWORD'] = {'old': '', 'new': '~ARCH'}
 
                 if not changes:
                     inst_v = version(param)
 
-                    if latest_version(param) == inst_v:
+                    # Prevent latest_version from calling refresh_db. Either we
+                    # just called it or we were asked not to.
+                    if latest_version(param, refresh=False) == inst_v:
                         all_uses = __salt__['portage_config.get_cleared_flags'](param)
                         if _flags_changed(*all_uses):
                             changes[param] = {'version': inst_v,
-                                                'old': {'use': all_uses[0]},
-                                                'new': {'use': all_uses[1]}}
+                                              'old': {'use': all_uses[0]},
+                                              'new': {'use': all_uses[1]}}
                 targets.append(target)
     else:
         targets = pkg_params
-    cmd = ['emerge', '--ask', 'n', '--quiet']
+
+    cmd = []
+    if salt.utils.systemd.has_scope(__context__) \
+            and __salt__['config.get']('systemd.scope', True):
+        cmd.extend(['systemd-run', '--scope'])
+    cmd.extend(['emerge', '--ask', 'n', '--quiet'])
     cmd.extend(bin_opts)
     cmd.extend(emerge_opts)
     cmd.extend(targets)
@@ -664,16 +686,40 @@ def install(name=None,
     call = __salt__['cmd.run_all'](cmd,
                                    output_loglevel='trace',
                                    python_shell=False)
-    __context__.pop('pkg.list_pkgs', None)
     if call['retcode'] != 0:
-        return _process_emerge_err(call['stdout'], call['stderr'])
+        needed_changes = _process_emerge_err(call['stdout'], call['stderr'])
+    else:
+        needed_changes = []
+
+    __context__.pop('pkg.list_pkgs', None)
     new = list_pkgs()
     changes.update(salt.utils.compare_dicts(old, new))
+
+    if needed_changes:
+        raise CommandExecutionError(
+            'Error occurred installing package(s)',
+            info={'needed changes': needed_changes, 'changes': changes}
+        )
+
     return changes
 
 
 def update(pkg, slot=None, fromrepo=None, refresh=False, binhost=None):
     '''
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands which modify installed packages from the
+        ``salt-minion`` daemon's control group. This is done to keep systemd
+        from killing any emerge commands spawned by Salt when the
+        ``salt-minion`` service is restarted. (see ``KillMode`` in the
+        `systemd.kill(5)`_ manpage for more information). If desired, usage of
+        `systemd-run(1)`_ can be suppressed by setting a :mod:`config option
+        <salt.modules.config.get>` called ``systemd.scope``, with a value of
+        ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+    .. _`systemd.kill(5)`: https://www.freedesktop.org/software/systemd/man/systemd.kill.html
+
     Updates the passed package (emerge --update package)
 
     slot
@@ -718,22 +764,55 @@ def update(pkg, slot=None, fromrepo=None, refresh=False, binhost=None):
         bin_opts = []
 
     old = list_pkgs()
-    cmd = ['emerge', '--ask', 'n', '--quiet', '--update', '--newuse',
-           '--oneshot']
+    cmd = []
+    if salt.utils.systemd.has_scope(__context__) \
+            and __salt__['config.get']('systemd.scope', True):
+        cmd.extend(['systemd-run', '--scope'])
+    cmd.extend(['emerge',
+                '--ask', 'n',
+                '--quiet',
+                '--update',
+                '--newuse',
+                '--oneshot'])
     cmd.extend(bin_opts)
     cmd.append(full_atom)
     call = __salt__['cmd.run_all'](cmd,
                                    output_loglevel='trace',
                                    python_shell=False)
-    __context__.pop('pkg.list_pkgs', None)
     if call['retcode'] != 0:
-        return _process_emerge_err(call['stdout'], call['stderr'])
+        needed_changes = _process_emerge_err(call['stdout'], call['stderr'])
+    else:
+        needed_changes = []
+
+    __context__.pop('pkg.list_pkgs', None)
     new = list_pkgs()
-    return salt.utils.compare_dicts(old, new)
+    ret = salt.utils.compare_dicts(old, new)
+
+    if needed_changes:
+        raise CommandExecutionError(
+            'Problem encountered updating package(s)',
+            info={'needed_changes': needed_changes, 'changes': ret}
+        )
+
+    return ret
 
 
 def upgrade(refresh=True, binhost=None, backtrack=3):
     '''
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands which modify installed packages from the
+        ``salt-minion`` daemon's control group. This is done to keep systemd
+        from killing any emerge commands spawned by Salt when the
+        ``salt-minion`` service is restarted. (see ``KillMode`` in the
+        `systemd.kill(5)`_ manpage for more information). If desired, usage of
+        `systemd-run(1)`_ can be suppressed by setting a :mod:`config option
+        <salt.modules.config.get>` called ``systemd.scope``, with a value of
+        ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+    .. _`systemd.kill(5)`: https://www.freedesktop.org/software/systemd/man/systemd.kill.html
+
     Run a full system upgrade (emerge -uDN @world)
 
     binhost
@@ -748,10 +827,13 @@ def upgrade(refresh=True, binhost=None, backtrack=3):
 
         .. versionadded: 2015.8.0
 
-    Return a dict containing the new package names and versions::
+    Returns a dictionary containing the changes:
 
-        {'<package>': {'old': '<old-version>',
-                       'new': '<new-version>'}}
+    .. code-block:: python
+
+        {'<package>':  {'old': '<old-version>',
+                        'new': '<new-version>'}}
+
 
     CLI Example:
 
@@ -774,35 +856,53 @@ def upgrade(refresh=True, binhost=None, backtrack=3):
         bin_opts = []
 
     old = list_pkgs()
-    cmd = ['emerge',
-           '--ask', 'n',
-           '--quiet',
-           '--backtrack', '{0}'.format(backtrack),
-           '--update',
-           '--newuse',
-           '--deep']
+    cmd = []
+    if salt.utils.systemd.has_scope(__context__) \
+            and __salt__['config.get']('systemd.scope', True):
+        cmd.extend(['systemd-run', '--scope'])
+    cmd.extend(['emerge',
+                '--ask', 'n',
+                '--quiet',
+                '--backtrack', '{0}'.format(backtrack),
+                '--update',
+                '--newuse',
+                '--deep'])
     if bin_opts:
         cmd.extend(bin_opts)
     cmd.append('@world')
 
-    call = __salt__['cmd.run_all'](cmd,
-                                   output_loglevel='trace',
-                                   python_shell=False)
-    if call['retcode'] != 0:
-        ret['result'] = False
-        if 'stderr' in call:
-            ret['comment'] += call['stderr']
-        if 'stdout' in call:
-            ret['comment'] += call['stdout']
-    else:
-        __context__.pop('pkg.list_pkgs', None)
-        new = list_pkgs()
-        ret['changes'] = salt.utils.compare_dicts(old, new)
+    result = __salt__['cmd.run_all'](cmd,
+                                     output_loglevel='trace',
+                                     python_shell=False)
+    __context__.pop('pkg.list_pkgs', None)
+    new = list_pkgs()
+    ret = salt.utils.compare_dicts(old, new)
+
+    if result['retcode'] != 0:
+        raise CommandExecutionError(
+            'Problem encountered upgrading packages',
+            info={'changes': ret, 'result': result}
+        )
+
     return ret
 
 
 def remove(name=None, slot=None, fromrepo=None, pkgs=None, **kwargs):
     '''
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands which modify installed packages from the
+        ``salt-minion`` daemon's control group. This is done to keep systemd
+        from killing any emerge commands spawned by Salt when the
+        ``salt-minion`` service is restarted. (see ``KillMode`` in the
+        `systemd.kill(5)`_ manpage for more information). If desired, usage of
+        `systemd-run(1)`_ can be suppressed by setting a :mod:`config option
+        <salt.modules.config.get>` called ``systemd.scope``, with a value of
+        ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+    .. _`systemd.kill(5)`: https://www.freedesktop.org/software/systemd/man/systemd.kill.html
+
     Remove packages via emerge --unmerge.
 
     name
@@ -851,18 +951,57 @@ def remove(name=None, slot=None, fromrepo=None, pkgs=None, **kwargs):
 
     if not targets:
         return {}
-    cmd = ['emerge', '--ask', 'n', '--quiet', '--unmerge',
-           '--quiet-unmerge-warn'] + targets
-    __salt__['cmd.run_all'](cmd,
-                            output_loglevel='trace',
-                            python_shell=False)
+
+    cmd = []
+    if salt.utils.systemd.has_scope(__context__) \
+            and __salt__['config.get']('systemd.scope', True):
+        cmd.extend(['systemd-run', '--scope'])
+    cmd.extend(['emerge',
+                '--ask', 'n',
+                '--quiet',
+                '--unmerge',
+                '--quiet-unmerge-warn'])
+    cmd.extend(targets)
+
+    out = __salt__['cmd.run_all'](
+        cmd,
+        output_loglevel='trace',
+        python_shell=False
+    )
+    if out['retcode'] != 0 and out['stderr']:
+        errors = [out['stderr']]
+    else:
+        errors = []
+
     __context__.pop('pkg.list_pkgs', None)
     new = list_pkgs()
-    return salt.utils.compare_dicts(old, new)
+    ret = salt.utils.compare_dicts(old, new)
+
+    if errors:
+        raise CommandExecutionError(
+            'Problem encountered removing package(s)',
+            info={'errors': errors, 'changes': ret}
+        )
+
+    return ret
 
 
 def purge(name=None, slot=None, fromrepo=None, pkgs=None, **kwargs):
     '''
+    .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
+        On minions running systemd>=205, `systemd-run(1)`_ is now used to
+        isolate commands which modify installed packages from the
+        ``salt-minion`` daemon's control group. This is done to keep systemd
+        from killing any emerge commands spawned by Salt when the
+        ``salt-minion`` service is restarted. (see ``KillMode`` in the
+        `systemd.kill(5)`_ manpage for more information). If desired, usage of
+        `systemd-run(1)`_ can be suppressed by setting a :mod:`config option
+        <salt.modules.config.get>` called ``systemd.scope``, with a value of
+        ``False`` (no quotes).
+
+    .. _`systemd-run(1)`: https://www.freedesktop.org/software/systemd/man/systemd-run.html
+    .. _`systemd.kill(5)`: https://www.freedesktop.org/software/systemd/man/systemd.kill.html
+
     Portage does not have a purge, this function calls remove followed
     by depclean to emulate a purge process
 
@@ -952,7 +1091,7 @@ def depclean(name=None, slot=None, fromrepo=None, pkgs=None):
     return salt.utils.compare_dicts(old, new)
 
 
-def version_cmp(pkg1, pkg2):
+def version_cmp(pkg1, pkg2, **kwargs):
     '''
     Do a cmp-style comparison on two packages. Return -1 if pkg1 < pkg2, 0 if
     pkg1 == pkg2, and 1 if pkg1 > pkg2. Return None if there was a problem
@@ -964,6 +1103,16 @@ def version_cmp(pkg1, pkg2):
 
         salt '*' pkg.version_cmp '0.2.4-0' '0.2.4.1-0'
     '''
+    # ignore_epoch is not supported here, but has to be included for API
+    # compatibility. Rather than putting this argument into the function
+    # definition (and thus have it show up in the docs), we just pop it out of
+    # the kwargs dict and then raise an exception if any kwargs other than
+    # ignore_epoch were passed.
+    kwargs = salt.utils.clean_kwargs(**kwargs)
+    kwargs.pop('ignore_epoch', None)
+    if kwargs:
+        salt.utils.invalid_kwargs(kwargs)
+
     regex = r'^~?([^:\[]+):?[^\[]*\[?.*$'
     ver1 = re.match(regex, pkg1)
     ver2 = re.match(regex, pkg2)
@@ -1014,7 +1163,11 @@ def check_extra_requirements(pkgname, pkgver):
     else:
         return True
 
-    cpv = _porttree().dbapi.xmatch('bestmatch-visible', atom)
+    try:
+        cpv = _porttree().dbapi.xmatch('bestmatch-visible', atom)
+    except portage.exception.InvalidAtom as iae:
+        log.error('Unable to find a matching package for {0}: ({1})'.format(atom, iae))
+        return False
 
     if cpv == '':
         return False

@@ -2,6 +2,12 @@
 '''
 Module for managing Windows Users
 
+.. important::
+    If you feel that Salt should be using this module to manage users on a
+    minion, and it is using a different module (or gives an error similar to
+    *'user.info' is not available*), see :ref:`here
+    <module-provider-override>`.
+
 :depends:
         - pywintypes
         - win32api
@@ -15,6 +21,8 @@ Module for managing Windows Users
     This currently only works with local user accounts, not domain accounts
 '''
 from __future__ import absolute_import
+from datetime import datetime
+import time
 
 try:
     from shlex import quote as _cmd_quote  # pylint: disable=E0611
@@ -54,7 +62,7 @@ def __virtual__():
     '''
     if HAS_WIN32NET_MODS and salt.utils.is_windows():
         return __virtualname__
-    return False
+    return (False, "Module win_useradd: module has failed dependencies or is not on Windows client")
 
 
 def add(name,
@@ -147,7 +155,13 @@ def update(name,
            home=None,
            homedrive=None,
            logonscript=None,
-           profile=None):
+           profile=None,
+           expiration_date=None,
+           expired=None,
+           account_disabled=None,
+           unlock_account=None,
+           password_never_expires=None,
+           disallow_change_password=None):
     r'''
     Updates settings for the windows user. Name is the only required parameter.
     Settings will only be changed if the parameter is passed a value.
@@ -179,8 +193,29 @@ def update(name,
     :param str profile:
         The path to the user's profile directory.
 
-    :return:
-        True if successful. False is unsuccessful.
+    :param date expiration_date: The date and time when the account expires. Can
+        be a valid date/time string. To set to never expire pass the string 'Never'.
+
+    :param bool expired: Pass `True` to expire the account. The user will be
+        prompted to change their password at the next logon. Pass `False` to mark
+        the account as 'not expired'. You can't use this to negate the expiration if
+        the expiration was caused by the account expiring. You'll have to change
+        the `expiration_date` as well.
+
+    :param bool account_disabled: True disables the account. False enables the
+        account.
+
+    :param bool unlock_account: True unlocks a locked user account. False is
+        ignored.
+
+    :param bool password_never_expires: True sets the password to never expire.
+        False allows the password to expire.
+
+    :param bool disallow_change_password: True blocks the user from changing
+        the password. False allows the user to change the password.
+
+    :return: True if successful. False is unsuccessful.
+
     :rtype: bool
 
     CLI Example:
@@ -219,6 +254,38 @@ def update(name,
         user_info['full_name'] = fullname
     if profile:
         user_info['profile'] = profile
+    if expiration_date:
+        if expiration_date == 'Never':
+            user_info['acct_expires'] = win32netcon.TIMEQ_FOREVER
+        else:
+            try:
+                dt_obj = salt.utils.date_cast(expiration_date)
+            except (ValueError, RuntimeError):
+                return 'Invalid Date/Time Format: {0}'.format(expiration_date)
+            user_info['acct_expires'] = time.mktime(dt_obj.timetuple())
+    if expired is not None:
+        if expired:
+            user_info['password_expired'] = 1
+        else:
+            user_info['password_expired'] = 0
+    if account_disabled is not None:
+        if account_disabled:
+            user_info['flags'] |= win32netcon.UF_ACCOUNTDISABLE
+        else:
+            user_info['flags'] ^= win32netcon.UF_ACCOUNTDISABLE
+    if unlock_account is not None:
+        if unlock_account:
+            user_info['flags'] ^= win32netcon.UF_LOCKOUT
+    if password_never_expires is not None:
+        if password_never_expires:
+            user_info['flags'] |= win32netcon.UF_DONT_EXPIRE_PASSWD
+        else:
+            user_info['flags'] ^= win32netcon.UF_DONT_EXPIRE_PASSWD
+    if disallow_change_password is not None:
+        if disallow_change_password:
+            user_info['flags'] |= win32netcon.UF_PASSWD_CANT_CHANGE
+        else:
+            user_info['flags'] ^= win32netcon.UF_PASSWD_CANT_CHANGE
 
     # Apply new settings
     try:
@@ -458,7 +525,7 @@ def removegroup(name, group):
     return ret['retcode'] == 0
 
 
-def chhome(name, home, persist=False):
+def chhome(name, home, **kwargs):
     '''
     Change the home directory of the user, pass True for persist to move files
     to the new home directory if the old home directory exist.
@@ -468,9 +535,6 @@ def chhome(name, home, persist=False):
 
     :param str home:
         new location of the home directory
-
-    :param bool persist:
-        True to move the contents of the existing home directory to the new location
 
     :return:
         True if successful. False is unsuccessful.
@@ -482,6 +546,13 @@ def chhome(name, home, persist=False):
 
         salt '*' user.chhome foo \\\\fileserver\\home\\foo True
     '''
+    kwargs = salt.utils.clean_kwargs(**kwargs)
+    persist = kwargs.pop('persist', False)
+    if kwargs:
+        salt.utils.invalid_kwargs(kwargs)
+    if persist:
+        log.info('Ignoring unsupported \'persist\' argument to user.chhome')
+
     pre_info = info(name)
 
     if not pre_info:
@@ -492,11 +563,6 @@ def chhome(name, home, persist=False):
 
     if not update(name=name, home=home):
         return False
-
-    if persist and home is not None and pre_info['home'] is not None:
-        cmd = 'move /Y {0} {1}'.format(pre_info['home'], home)
-        if __salt__['cmd.retcode'](cmd, python_shell=False) != 0:
-            log.debug('Failed to move the contents of the Home Directory')
 
     post_info = info(name)
     if post_info['home'] != pre_info['home']:
@@ -515,8 +581,8 @@ def chprofile(name, profile):
     :param str profile:
         new location of the profile
 
-    :return:
-    True if successful. False is unsuccessful.
+    :return: True if successful. False is unsuccessful.
+
     :rtype: bool
 
     CLI Example:
@@ -599,7 +665,10 @@ def chgroups(name, groups, append=True):
             continue
         group = _cmd_quote(group).lstrip('\'').rstrip('\'')
         cmd = 'net localgroup "{0}" {1} /add'.format(group, name)
-        __salt__['cmd.run_all'](cmd, python_shell=True)
+        out = __salt__['cmd.run_all'](cmd, python_shell=True)
+        if out['retcode'] != 0:
+            log.error(out['stdout'])
+            return False
 
     agrps = set(list_groups(name))
     return len(ugrps - agrps) == 0
@@ -626,6 +695,14 @@ def info(name):
             - home
             - homedrive
             - groups
+            - password_changed
+            - successful_logon_attempts
+            - failed_logon_attempts
+            - last_logon
+            - account_disabled
+            - account_locked
+            - password_never_expires
+            - disallow_change_password
             - gid
     :rtype: dict
 
@@ -658,6 +735,19 @@ def info(name):
         ret['active'] = (not bool(items['flags'] & win32netcon.UF_ACCOUNTDISABLE))
         ret['logonscript'] = items['script_path']
         ret['profile'] = items['profile']
+        ret['failed_logon_attempts'] = items['bad_pw_count']
+        ret['successful_logon_attempts'] = items['num_logons']
+        secs = time.mktime(datetime.now().timetuple()) - items['password_age']
+        ret['password_changed'] = datetime.fromtimestamp(secs). \
+            strftime('%Y-%m-%d %H:%M:%S')
+        if items['last_logon'] == 0:
+            ret['last_logon'] = 'Never'
+        else:
+            ret['last_logon'] = datetime.fromtimestamp(items['last_logon']).\
+                strftime('%Y-%m-%d %H:%M:%S')
+        ret['expiration_date'] = datetime.fromtimestamp(items['acct_expires']).\
+            strftime('%Y-%m-%d %H:%M:%S')
+        ret['expired'] = items['password_expired'] == 1
         if not ret['profile']:
             ret['profile'] = _get_userprofile_from_registry(name, ret['uid'])
         ret['home'] = items['home_dir']
@@ -665,9 +755,30 @@ def info(name):
         if not ret['home']:
             ret['home'] = ret['profile']
         ret['groups'] = groups
+        if items['flags'] & win32netcon.UF_DONT_EXPIRE_PASSWD == 0:
+            ret['password_never_expires'] = False
+        else:
+            ret['password_never_expires'] = True
+        if items['flags'] & win32netcon.UF_ACCOUNTDISABLE == 0:
+            ret['account_disabled'] = False
+        else:
+            ret['account_disabled'] = True
+        if items['flags'] & win32netcon.UF_LOCKOUT == 0:
+            ret['account_locked'] = False
+        else:
+            ret['account_locked'] = True
+        if items['flags'] & win32netcon.UF_PASSWD_CANT_CHANGE == 0:
+            ret['disallow_change_password'] = False
+        else:
+            ret['disallow_change_password'] = True
+
         ret['gid'] = ''
 
-    return ret
+        return ret
+
+    else:
+
+        return {}
 
 
 def _get_userprofile_from_registry(user, sid):
@@ -675,10 +786,11 @@ def _get_userprofile_from_registry(user, sid):
     In case net user doesn't return the userprofile
     we can get it from the registry
     '''
-    profile_dir = __salt__['reg.read_key'](
-        'HKEY_LOCAL_MACHINE', u'SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{0}'.format(sid),
+    profile_dir = __salt__['reg.read_value'](
+        'HKEY_LOCAL_MACHINE',
+        u'SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList\\{0}'.format(sid),
         'ProfileImagePath'
-    )
+    )['vdata']
     log.debug(u'user {0} with sid={2} profile is located at "{1}"'.format(user, profile_dir, sid))
     return profile_dir
 

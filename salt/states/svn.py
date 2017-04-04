@@ -3,9 +3,15 @@
 Manage SVN repositories
 =======================
 
-Manage repository checkouts via the svn vcs system:
+Manage repository checkouts via the svn vcs system. Note that subversion must
+be installed for these states to be available, so svn states should include a
+requisite to a pkg.installed state for the package which provides subversion
+(``subversion`` in most cases). Example:
 
 .. code-block:: yaml
+
+    subversion:
+      pkg.installed
 
     http://unladen-swallow.googlecode.com/svn/trunk/:
       svn.latest:
@@ -96,6 +102,10 @@ def latest(name,
                     ('{0} doesn\'t exist and is set to be checked out.').format(target))
         svn_cmd = 'svn.diff'
         opts += ('-r', 'HEAD')
+
+        if trust:
+            opts += ('--trust-server-cert',)
+
         out = __salt__[svn_cmd](cwd, target, user, username, password, *opts)
         return _neutral_test(
                 ret,

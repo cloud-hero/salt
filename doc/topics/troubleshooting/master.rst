@@ -1,3 +1,5 @@
+.. _troubleshooting-salt-master:
+
 ===============================
 Troubleshooting the Salt Master
 ===============================
@@ -27,8 +29,8 @@ What Ports does the Master Need Open?
 For the master, TCP ports 4505 and 4506 need to be open. If you've put both
 your Salt master and minion in debug mode and don't see an acknowledgment
 that your minion has connected, it could very well be a firewall interfering
-with the connection. See our :doc:`firewall configuration
-</topics/tutorials/firewall>` page for help opening the firewall on various
+with the connection. See our :ref:`firewall configuration
+<firewall>` page for help opening the firewall on various
 platforms.
 
 If you've opened the correct TCP ports and still aren't seeing connections,
@@ -181,18 +183,17 @@ Commands Time Out or Do Not Return Output
 =========================================
 
 Depending on your OS (this is most common on Ubuntu due to apt-get) you may
-sometimes encounter times where your highstate, or other long running commands
-do not return output.
-
-.. note::
-    A number of timing issues were resolved in the 2014.1 release of Salt.
-    Upgrading to at least this version is strongly recommended if timeouts
-    persist.
+sometimes encounter times where a :py:func:`state.apply
+<salt.modules.state.apply_>`, or other long running commands do not return
+output.
 
 By default the timeout is set to 5 seconds. The timeout value can easily be
 increased by modifying the ``timeout`` line within your ``/etc/salt/master``
 configuration file.
 
+Having keys accepted for Salt minions that no longer exist or are not reachable
+also increases the possibility of timeouts, since the Salt master waits for
+those systems to return command results.
 
 Passing the -c Option to Salt Returns a Permissions Error
 =========================================================
@@ -223,7 +224,7 @@ Salt Master Auth Flooding
 
 In large installations, care must be taken not to overwhealm the master with
 authentication requests. Several options can be set on the master which
-mitigate the chances of an authentication flood from causing an interuption in
+mitigate the chances of an authentication flood from causing an interruption in
 service.
 
 .. note::
@@ -249,9 +250,8 @@ service.
         of the number of attempts.
 
 
-=====================
-Running state locally
-=====================
+Running states locally
+======================
 
 To debug the states, you can use call locally.
 
@@ -274,3 +274,12 @@ The default configuration for the ``file_roots`` is:
        - /srv/salt
 
 So the top file is defaulted to the location ``/srv/salt/top.sls``
+
+
+Salt Master Umask
+=================
+
+The salt master uses a cache to track jobs as they are published and returns come back.
+The recommended umask for a salt-master is `022`, which is the default for most users
+on a system. Incorrect umasks can result in permission-denied errors when the master
+tries to access files in its cache.

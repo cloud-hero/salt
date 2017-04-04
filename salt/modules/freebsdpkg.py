@@ -2,6 +2,12 @@
 '''
 Remote package support using ``pkg_add(1)``
 
+.. important::
+    If you feel that Salt should be using this module to manage packages on a
+    minion, and it is using a different module (or gives an error similar to
+    *'pkg.install' is not available*), see :ref:`here
+    <module-provider-override>`.
+
 .. warning::
 
     This module has been completely rewritten. Up to and including version
@@ -97,9 +103,9 @@ def __virtual__():
         if providers and 'pkg' in providers and providers['pkg'] == 'pkgng':
             log.debug('Configuration option \'providers:pkg\' is set to '
                     '\'pkgng\', won\'t load old provider \'freebsdpkg\'.')
-            return False
+            return (False, 'The freebsdpkg execution module cannot be loaded: the configuration option \'providers:pkg\' is set to \'pkgng\'')
         return __virtualname__
-    return False
+    return (False, 'The freebsdpkg execution module cannot be loaded: either the os is not FreeBSD or the version of FreeBSD is >= 10.')
 
 
 def _get_repo_options(fromrepo=None, packagesite=None):
@@ -192,7 +198,7 @@ def latest_version(*names, **kwargs):
     return '' if len(names) == 1 else dict((x, '') for x in names)
 
 # available_version is being deprecated
-available_version = latest_version
+available_version = salt.utils.alias_function(latest_version, 'available_version')
 
 
 def version(*names, **kwargs):
@@ -389,30 +395,29 @@ def install(name=None,
     args.extend(pkg_params)
 
     old = list_pkgs()
-    __salt__['cmd.run'](
+    out = __salt__['cmd.run_all'](
         ['pkg_add'] + args,
         env=env,
         output_loglevel='trace',
         python_shell=False
     )
+    if out['retcode'] != 0 and out['stderr']:
+        errors = [out['stderr']]
+    else:
+        errors = []
+
     __context__.pop('pkg.list_pkgs', None)
     new = list_pkgs()
     _rehash()
-    return salt.utils.compare_dicts(old, new)
+    ret = salt.utils.compare_dicts(old, new)
 
+    if errors:
+        raise CommandExecutionError(
+            'Problem encountered installing package(s)',
+            info={'errors': errors, 'changes': ret}
+        )
 
-def upgrade():
-    '''
-    Upgrades are not supported with ``pkg_add(1)``. This function is included
-    for API compatibility only and always returns an empty dict.
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' pkg.upgrade
-    '''
-    return {}
+    return ret
 
 
 def remove(name=None, pkgs=None, **kwargs):
@@ -453,19 +458,33 @@ def remove(name=None, pkgs=None, **kwargs):
         log.error(error)
     if not targets:
         return {}
-    __salt__['cmd.run'](
+
+    out = __salt__['cmd.run_all'](
         ['pkg_delete'] + targets,
         output_loglevel='trace',
         python_shell=False
     )
+    if out['retcode'] != 0 and out['stderr']:
+        errors = [out['stderr']]
+    else:
+        errors = []
+
     __context__.pop('pkg.list_pkgs', None)
     new = list_pkgs()
-    return salt.utils.compare_dicts(old, new)
+    ret = salt.utils.compare_dicts(old, new)
+
+    if errors:
+        raise CommandExecutionError(
+            'Problem encountered removing package(s)',
+            info={'errors': errors, 'changes': ret}
+        )
+
+    return ret
 
 # Support pkg.delete to remove packages to more closely match pkg_delete
-delete = remove
+delete = salt.utils.alias_function(remove, 'delete')
 # No equivalent to purge packages, use remove instead
-purge = remove
+purge = salt.utils.alias_function(remove, 'purge')
 
 
 def _rehash():
@@ -473,11 +492,9 @@ def _rehash():
     Recomputes internal hash table for the PATH variable. Use whenever a new
     command is created during the current session.
     '''
-    shell = __salt__['environ.get']('SHELL', output_loglevel='trace')
+    shell = __salt__['environ.get']('SHELL')
     if shell.split('/')[-1] in ('csh', 'tcsh'):
-        __salt__['cmd.run'](['rehash'],
-                            output_loglevel='trace',
-                            python_shell=False)
+        __salt__['cmd.shell']('rehash', output_loglevel='trace')
 
 
 def file_list(*packages):

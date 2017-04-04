@@ -5,7 +5,7 @@ Connection module for Amazon EC2
 .. versionadded:: 2015.8.0
 
 :configuration: This module accepts explicit EC2 credentials but can also
-    utilize IAM roles assigned to the instance trough Instance Profiles.
+    utilize IAM roles assigned to the instance through Instance Profiles.
     Dynamic credentials are then automatically obtained from AWS API and no
     further configuration is necessary. More Information available at:
 
@@ -29,15 +29,15 @@ Connection module for Amazon EC2
 
     If a region is not specified, the default is us-east-1.
 
-    It's also possible to specify key, keyid and region via a profile, either
+    It's also possible to specify key, keyid, and region via a profile, either
     as a passed in dict, or as a string to pull from pillars or minion config:
 
     .. code-block:: yaml
 
         myprofile:
-            keyid: GKTADJGHEIQSXMKKRBJ08H
-            key: askdjghsdfjkghWupUjasdflkdfklgjsdfjajkghs
-            region: us-east-1
+          keyid: GKTADJGHEIQSXMKKRBJ08H
+          key: askdjghsdfjkghWupUjasdflkdfklgjsdfjajkghs
+          region: us-east-1
 
 :depends: boto
 
@@ -49,12 +49,14 @@ Connection module for Amazon EC2
 from __future__ import absolute_import
 import logging
 import time
-from distutils.version import LooseVersion as _LooseVersion  # pylint: disable=import-error,no-name-in-module
+import json
 
 # Import Salt libs
+import salt.utils
 import salt.utils.compat
 import salt.ext.six as six
 from salt.exceptions import SaltInvocationError, CommandExecutionError
+from salt.utils.versions import LooseVersion as _LooseVersion
 
 # Import third party libs
 try:
@@ -62,6 +64,7 @@ try:
     import boto
     import boto.ec2
     # pylint: enable=unused-import
+    from boto.ec2.blockdevicemapping import BlockDeviceMapping, BlockDeviceType
     HAS_BOTO = True
 except ImportError:
     HAS_BOTO = False
@@ -80,10 +83,12 @@ def __virtual__():
     # which was added in boto 2.8.0
     # https://github.com/boto/boto/commit/33ac26b416fbb48a60602542b4ce15dcc7029f12
     if not HAS_BOTO:
-        return False
+        return (False, "The boto_ec2 module cannot be loaded: boto library not found")
     elif _LooseVersion(boto.__version__) < _LooseVersion(required_boto_version):
-        return False
-    return True
+        return (False, "The boto_ec2 module cannot be loaded: boto library version incorrect ")
+    else:
+        __utils__['boto.assign_funcs'](__name__, 'ec2', pack=__salt__)
+        return True
 
 
 def __init__(opts):
@@ -137,10 +142,55 @@ def get_all_eip_addresses(addresses=None, allocation_ids=None, region=None,
 
         salt-call boto_ec2.get_all_eip_addresses
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
     '''
     return [x.public_ip for x in _get_all_eip_addresses(addresses, allocation_ids, region,
                 key, keyid, profile)]
+
+
+def get_unassociated_eip_address(domain='standard', region=None, key=None,
+                                 keyid=None, profile=None):
+    '''
+    Return the first unassociated EIP
+
+    domain
+        Indicates whether the address is a EC2 address or a VPC address
+        (standard|vpc).
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-call boto_ec2.get_unassociated_eip_address
+
+    .. versionadded:: 2016.3.0
+    '''
+    eip = None
+    for address in get_all_eip_addresses(region=region, key=key, keyid=keyid,
+                                         profile=profile):
+        address_info = get_eip_address_info(addresses=address, region=region,
+                                            key=key, keyid=keyid,
+                                            profile=profile)[0]
+        if address_info['instance_id']:
+            log.debug('{0} is already associated with the instance {1}'.format(
+                address, address_info['instance_id']))
+            continue
+
+        if address_info['network_interface_id']:
+            log.debug('{0} is already associated with the network interface {1}'
+                      .format(address, address_info['network_interface_id']))
+            continue
+
+        if address_info['domain'] == domain:
+            log.debug("The first unassociated EIP address in the domain '{0}' "
+                      "is {1}".format(domain, address))
+            eip = address
+            break
+
+    if not eip:
+        log.debug('No unassociated Elastic IP found!')
+
+    return eip
 
 
 def get_eip_address_info(addresses=None, allocation_ids=None, region=None, key=None,
@@ -164,7 +214,7 @@ def get_eip_address_info(addresses=None, allocation_ids=None, region=None, key=N
 
         salt-call boto_ec2.get_eip_address_info addresses=52.4.2.15
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
     '''
     if type(addresses) == (type('string')):
         addresses = [addresses]
@@ -201,7 +251,7 @@ def allocate_eip_address(domain=None, region=None, key=None, keyid=None, profile
 
         salt-call boto_ec2.allocate_eip_address domain=vpc
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
     '''
     if domain and domain != 'vpc':
         raise SaltInvocationError('The only permitted value for the \'domain\' param is \'vpc\'.')
@@ -224,8 +274,8 @@ def allocate_eip_address(domain=None, region=None, key=None, keyid=None, profile
 def release_eip_address(public_ip=None, allocation_id=None, region=None, key=None,
                         keyid=None, profile=None):
     '''
-    Free an Elastic IP address.  Pass either a public IP address to release a 'standard'
-    EC2 Elastic IP address, or an AllocationId to release a VPC Elastic IP address.
+    Free an Elastic IP address.  Pass either a public IP address to release an
+    EC2 Classic EIP, or an AllocationId to release a VPC EIP.
 
     public_ip
         (string) - The public IP address - for EC2 elastic IPs.
@@ -241,11 +291,11 @@ def release_eip_address(public_ip=None, allocation_id=None, region=None, key=Non
 
         salt myminion boto_ec2.release_eip_address allocation_id=eipalloc-ef382c8a
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
     '''
-    if not _exactly_one((public_ip, allocation_id)):
-        raise SaltInvocationError('Exactly one (but not both) of \'public_ip\' '
-                                  'or \'allocation_id\' must be provided')
+    if not salt.utils.exactly_one((public_ip, allocation_id)):
+        raise SaltInvocationError("Exactly one of 'public_ip' OR "
+                                  "'allocation_id' must be provided")
 
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
 
@@ -257,11 +307,13 @@ def release_eip_address(public_ip=None, allocation_id=None, region=None, key=Non
 
 
 def associate_eip_address(instance_id=None, instance_name=None, public_ip=None,
-        allocation_id=None, network_interface_id=None, private_ip_address=None,
-        allow_reassociation=False, region=None, key=None, keyid=None, profile=None):
+                          allocation_id=None, network_interface_id=None,
+                          network_interface_name=None, private_ip_address=None,
+                          allow_reassociation=False, region=None, key=None,
+                          keyid=None, profile=None):
     '''
-    Associate an Elastic IP address with a currently running instance.  This
-    requires exactly one of either 'public_ip' or 'allocation_id', depending
+    Associate an Elastic IP address with a currently running instance or a network interface.
+    This requires exactly one of either 'public_ip' or 'allocation_id', depending
     on whether you’re associating a VPC address or a plain EC2 address.
 
     instance_id
@@ -272,13 +324,17 @@ def associate_eip_address(instance_id=None, instance_name=None, public_ip=None,
         (string) – Public IP address, for standard EC2 based allocations.
     allocation_id
         (string) – Allocation ID for a VPC-based EIP.
+    network_interface_id
+        (string) - ID of the network interface to associate the EIP with
+    network_interface_name
+        (string) - Name of the network interface to associate the EIP with
     private_ip_address
         (string) – The primary or secondary private IP address to associate with the Elastic IP address.
     allow_reassociation
         (bool)   – Allow a currently associated EIP to be re-associated with the new instance or interface.
 
     returns
-        (bool)   - True on success, False otherwise
+        (bool)   - True on success, False on failure.
 
     CLI Example:
 
@@ -286,29 +342,49 @@ def associate_eip_address(instance_id=None, instance_name=None, public_ip=None,
 
         salt myminion boto_ec2.associate_eip_address instance_name=bubba.ho.tep allocation_id=eipalloc-ef382c8a
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
     '''
-    if not _exactly_one((instance_id, instance_name)):
-        raise SaltInvocationError('Exactly one (but not both) of \'instance_id\' '
-                                  'or \'instance_name\' must be provided')
+    if not salt.utils.exactly_one((instance_id, instance_name,
+                                   network_interface_id,
+                                   network_interface_name)):
+        raise SaltInvocationError("Exactly one of 'instance_id', "
+                                  "'instance_name', 'network_interface_id', "
+                                  "'network_interface_name' must be provided")
 
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
 
     if instance_name:
         try:
-            instance_id = get_id(name=instance_name, region=region, key=key, keyid=keyid, profile=profile)
+            instance_id = get_id(name=instance_name, region=region, key=key,
+                                 keyid=keyid, profile=profile)
         except boto.exception.BotoServerError as e:
             log.error(e)
             return False
+        if not instance_id:
+            log.error("Given instance_name '{0}' cannot be mapped to an "
+                      "instance_id".format(instance_name))
+            return False
 
-    if not instance_id:
-        log.error("Given instance_name cannot be mapped to an instance_id")
-        return False
+    if network_interface_name:
+        try:
+            network_interface_id = get_network_interface_id(
+                network_interface_name, region=region, key=key, keyid=keyid,
+                profile=profile)
+        except boto.exception.BotoServerError as e:
+            log.error(e)
+            return False
+        if not network_interface_id:
+            log.error("Given network_interface_name '{0}' cannot be mapped to "
+                      "an network_interface_id".format(network_interface_name))
+            return False
 
     try:
-        return conn.associate_address(instance_id=instance_id, public_ip=public_ip,
-              allocation_id=allocation_id, network_interface_id=network_interface_id,
-              private_ip_address=private_ip_address, allow_reassociation=allow_reassociation)
+        return conn.associate_address(instance_id=instance_id,
+                                      public_ip=public_ip,
+                                      allocation_id=allocation_id,
+                                      network_interface_id=network_interface_id,
+                                      private_ip_address=private_ip_address,
+                                      allow_reassociation=allow_reassociation)
     except boto.exception.BotoServerError as e:
         log.error(e)
         return False
@@ -319,15 +395,15 @@ def disassociate_eip_address(public_ip=None, association_id=None, region=None,
     '''
     Disassociate an Elastic IP address from a currently running instance. This
     requires exactly one of either 'association_id' or 'public_ip', depending
-    on whether you’re associating a VPC address or a plain EC2 address.
+    on whether you’re dealing with a VPC or EC2 Classic address.
 
     public_ip
-        (string) – Public IP address, for standard EC2 based allocations.
+        (string) – Public IP address, for EC2 Classic allocations.
     association_id
-        (string) – Association ID for a VPC-based EIP.
+        (string) – Association ID for a VPC-bound EIP.
 
     returns
-        (bool)   - True on success, False otherwise
+        (bool)   - True on success, False on failure.
 
     CLI Example:
 
@@ -335,12 +411,124 @@ def disassociate_eip_address(public_ip=None, association_id=None, region=None,
 
         salt myminion boto_ec2.disassociate_eip_address association_id=eipassoc-e3ba2d16
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
     '''
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
 
     try:
         return conn.disassociate_address(public_ip, association_id)
+    except boto.exception.BotoServerError as e:
+        log.error(e)
+        return False
+
+
+def assign_private_ip_addresses(network_interface_name=None, network_interface_id=None,
+                                private_ip_addresses=None, secondary_private_ip_address_count=None,
+                                allow_reassignment=False, region=None, key=None,
+                                keyid=None, profile=None):
+    '''
+    Assigns one or more secondary private IP addresses to a network interface.
+
+    network_interface_id
+        (string) - ID of the network interface to associate the IP with (exclusive with 'network_interface_name')
+    network_interface_name
+        (string) - Name of the network interface to associate the IP with (exclusive with 'network_interface_id')
+    private_ip_addresses
+        (list) - Assigns the specified IP addresses as secondary IP addresses to the network interface (exclusive with 'secondary_private_ip_address_count')
+    secondary_private_ip_address_count
+        (int) - The number of secondary IP addresses to assign to the network interface. (exclusive with 'private_ip_addresses')
+    allow_reassociation
+        (bool)   – Allow a currently associated EIP to be re-associated with the new instance or interface.
+
+    returns
+        (bool)   - True on success, False on failure.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt myminion boto_ec2.assign_private_ip_addresses network_interface_name=my_eni private_ip_addresses=private_ip
+        salt myminion boto_ec2.assign_private_ip_addresses network_interface_name=my_eni secondary_private_ip_address_count=2
+
+    .. versionadded:: Nitrogen
+    '''
+    if not salt.utils.exactly_one((network_interface_name,
+                                   network_interface_id)):
+        raise SaltInvocationError("Exactly one of 'network_interface_name', "
+                                  "'network_interface_id' must be provided")
+
+    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
+
+    if network_interface_name:
+        try:
+            network_interface_id = get_network_interface_id(
+                network_interface_name, region=region, key=key, keyid=keyid,
+                profile=profile)
+        except boto.exception.BotoServerError as e:
+            log.error(e)
+            return False
+        if not network_interface_id:
+            log.error("Given network_interface_name '{0}' cannot be mapped to "
+                      "an network_interface_id".format(network_interface_name))
+            return False
+
+    try:
+        return conn.assign_private_ip_addresses(network_interface_id=network_interface_id,
+                                                private_ip_addresses=private_ip_addresses,
+                                                secondary_private_ip_address_count=secondary_private_ip_address_count,
+                                                allow_reassignment=allow_reassignment)
+    except boto.exception.BotoServerError as e:
+        log.error(e)
+        return False
+
+
+def unassign_private_ip_addresses(network_interface_name=None, network_interface_id=None,
+                                  private_ip_addresses=None, region=None,
+                                  key=None, keyid=None, profile=None):
+    '''
+    Unassigns one or more secondary private IP addresses from a network interface
+
+    network_interface_id
+        (string) - ID of the network interface to associate the IP with (exclusive with 'network_interface_name')
+    network_interface_name
+        (string) - Name of the network interface to associate the IP with (exclusive with 'network_interface_id')
+    private_ip_addresses
+        (list) - Assigns the specified IP addresses as secondary IP addresses to the network interface.
+
+    returns
+        (bool)   - True on success, False on failure.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt myminion boto_ec2.unassign_private_ip_addresses network_interface_name=my_eni private_ip_addresses=private_ip
+
+    .. versionadded:: Nitrogen
+    '''
+    if not salt.utils.exactly_one((network_interface_name,
+                                   network_interface_id)):
+        raise SaltInvocationError("Exactly one of 'network_interface_name', "
+                                  "'network_interface_id' must be provided")
+
+    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
+
+    if network_interface_name:
+        try:
+            network_interface_id = get_network_interface_id(
+                network_interface_name, region=region, key=key, keyid=keyid,
+                profile=profile)
+        except boto.exception.BotoServerError as e:
+            log.error(e)
+            return False
+        if not network_interface_id:
+            log.error("Given network_interface_name '{0}' cannot be mapped to "
+                      "an network_interface_id".format(network_interface_name))
+            return False
+
+    try:
+        return conn.unassign_private_ip_addresses(network_interface_id=network_interface_id,
+                                                  private_ip_addresses=private_ip_addresses)
     except boto.exception.BotoServerError as e:
         log.error(e)
         return False
@@ -363,7 +551,7 @@ def get_zones(region=None, key=None, keyid=None, profile=None):
 
 def find_instances(instance_id=None, name=None, tags=None, region=None,
                    key=None, keyid=None, profile=None, return_objs=False,
-                   in_states=None):
+                   in_states=None, filters=None):
 
     '''
     Given instance properties, find and return matching instance ids
@@ -375,12 +563,11 @@ def find_instances(instance_id=None, name=None, tags=None, region=None,
         salt myminion boto_ec2.find_instances # Lists all instances
         salt myminion boto_ec2.find_instances name=myinstance
         salt myminion boto_ec2.find_instances tags='{"mytag": "value"}'
+        salt myminion boto_ec2.find_instances filters='{"vpc-id": "vpc-12345678"}'
 
     '''
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
 
-    if not any((instance_id, name, tags)):
-        return []
     try:
         filter_parameters = {'filters': {}}
 
@@ -394,7 +581,10 @@ def find_instances(instance_id=None, name=None, tags=None, region=None,
             for tag_name, tag_value in six.iteritems(tags):
                 filter_parameters['filters']['tag:{0}'.format(tag_name)] = tag_value
 
-        reservations = conn.get_all_instances(**filter_parameters)
+        if filters:
+            filter_parameters['filters'].update(filters)
+
+        reservations = conn.get_all_reservations(**filter_parameters)
         instances = [i for r in reservations for i in r.instances]
         log.debug('The filters criteria {0} matched the following '
                   'instances:{1}'.format(filter_parameters, instances))
@@ -416,7 +606,7 @@ def find_instances(instance_id=None, name=None, tags=None, region=None,
 
 def create_image(ami_name, instance_id=None, instance_name=None, tags=None, region=None,
                  key=None, keyid=None, profile=None, description=None, no_reboot=False,
-                 dry_run=False):
+                 dry_run=False, filters=None):
     '''
     Given instance properties that define exactly one instance, create AMI and return AMI-id.
 
@@ -424,14 +614,14 @@ def create_image(ami_name, instance_id=None, instance_name=None, tags=None, regi
 
     .. code-block:: bash
 
-        salt myminion boto_ec2.create_instance ami_name instance_name=myinstance
-        salt myminion boto_ec2.create_instance another_ami_name tags='{"mytag": "value"}' description='this is my ami'
+        salt myminion boto_ec2.create_image ami_name instance_name=myinstance
+        salt myminion boto_ec2.create_image another_ami_name tags='{"mytag": "value"}' description='this is my ami'
 
     '''
 
     instances = find_instances(instance_id=instance_id, name=instance_name, tags=tags,
                                region=region, key=key, keyid=keyid, profile=profile,
-                               return_objs=True)
+                               return_objs=True, filters=filters)
 
     if not instances:
         log.error('Source instance not found')
@@ -459,7 +649,7 @@ def find_images(ami_name=None, executable_by=None, owners=None, image_ids=None, 
 
     .. code-block:: bash
 
-        salt myminion boto_ec2.find_instances tags='{"mytag": "value"}'
+        salt myminion boto_ec2.find_images tags='{"mytag": "value"}'
 
     '''
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
@@ -499,7 +689,7 @@ def find_images(ami_name=None, executable_by=None, owners=None, image_ids=None, 
 
 
 def terminate(instance_id=None, name=None, region=None,
-              key=None, keyid=None, profile=None):
+              key=None, keyid=None, profile=None, filters=None):
     '''
     Terminate the instance described by instance_id or name.
 
@@ -512,7 +702,8 @@ def terminate(instance_id=None, name=None, region=None,
     '''
     instances = find_instances(instance_id=instance_id, name=name,
                                region=region, key=key, keyid=keyid,
-                               profile=profile, return_objs=True)
+                               profile=profile, return_objs=True,
+                               filters=filters)
     if instances in (False, None, []):
         return instances
 
@@ -525,10 +716,10 @@ def terminate(instance_id=None, name=None, region=None,
 
 
 def get_id(name=None, tags=None, region=None, key=None,
-           keyid=None, profile=None, in_states=None):
+           keyid=None, profile=None, in_states=None, filters=None):
 
     '''
-    Given instace properties, return the instance id if it exist.
+    Given instance properties, return the instance id if it exists.
 
     CLI Example:
 
@@ -538,7 +729,8 @@ def get_id(name=None, tags=None, region=None, key=None,
 
     '''
     instance_ids = find_instances(name=name, tags=tags, region=region, key=key,
-                                  keyid=keyid, profile=profile, in_states=in_states)
+                                  keyid=keyid, profile=profile, in_states=in_states,
+                                  filters=filters)
     if instance_ids:
         log.info("Instance ids: {0}".format(" ".join(instance_ids)))
         if len(instance_ids) == 1:
@@ -552,7 +744,7 @@ def get_id(name=None, tags=None, region=None, key=None,
 
 
 def exists(instance_id=None, name=None, tags=None, region=None, key=None,
-           keyid=None, profile=None, in_states=None):
+           keyid=None, profile=None, in_states=None, filters=None):
     '''
     Given a instance id, check to see if the given instance id exists.
 
@@ -566,13 +758,67 @@ def exists(instance_id=None, name=None, tags=None, region=None, key=None,
         salt myminion boto_ec2.exists myinstance
     '''
     instances = find_instances(instance_id=instance_id, name=name, tags=tags,
-                               in_states=in_states)
+                               region=region, key=key, keyid=keyid,
+                               profile=profile, in_states=in_states, filters=filters)
     if instances:
         log.info('Instance exists.')
         return True
     else:
         log.warning('Instance does not exist.')
         return False
+
+
+def _to_blockdev_map(thing):
+    '''
+    Convert a string, or a json payload, or a dict in the right
+    format, into a boto.ec2.blockdevicemapping.BlockDeviceMapping as
+    needed by instance_present().  The following YAML is a direct
+    representation of what is expected by the underlying boto EC2 code.
+
+    YAML example:
+
+    .. code-block:: yaml
+        device-maps:
+            /dev/sdb:
+                ephemeral_name: ephemeral0
+            /dev/sdc:
+                ephemeral_name: ephemeral1
+            /dev/sdd:
+                ephemeral_name: ephemeral2
+            /dev/sde:
+                ephemeral_name: ephemeral3
+            /dev/sdf:
+                size: 20
+                volume_type: gp2
+
+    '''
+    if not thing:
+        return None
+    if isinstance(thing, BlockDeviceMapping):
+        return thing
+    if isinstance(thing, six.string_types):
+        thing = json.loads(thing)
+    if not isinstance(thing, dict):
+        log.error("Can't convert '{0}' of type {1} to a "
+                  "boto.ec2.blockdevicemapping.BlockDeviceMapping".format(thing, type(thing)))
+        return None
+
+    bdm = BlockDeviceMapping()
+    for d, t in six.iteritems(thing):
+        bdt = BlockDeviceType(ephemeral_name=t.get('ephemeral_name'),
+                              no_device=t.get('no_device', False),
+                              volume_id=t.get('volume_id'),
+                              snapshot_id=t.get('snapshot_id'),
+                              status=t.get('status'),
+                              attach_time=t.get('attach_time'),
+                              delete_on_termination=t.get('delete_on_termination', False),
+                              size=t.get('size'),
+                              volume_type=t.get('volume_type'),
+                              iops=t.get('iops'),
+                              encrypted=t.get('encrypted'))
+        bdm[d] = bdt
+
+    return bdm
 
 
 def run(image_id, name=None, tags=None, key_name=None, security_groups=None,
@@ -583,8 +829,9 @@ def run(image_id, name=None, tags=None, key_name=None, security_groups=None,
         instance_initiated_shutdown_behavior=None, placement_group=None,
         client_token=None, security_group_ids=None, security_group_names=None,
         additional_info=None, tenancy=None, instance_profile_arn=None,
-        instance_profile_name=None, ebs_optimized=None, network_interfaces=None,
-        region=None, key=None, keyid=None, profile=None):
+        instance_profile_name=None, ebs_optimized=None,
+        network_interface_id=None, network_interface_name=None,
+        region=None, key=None, keyid=None, profile=None, network_interfaces=None):
     #TODO: support multi-instance reservations
     '''
     Create and start an EC2 instance.
@@ -637,6 +884,22 @@ def run(image_id, name=None, tags=None, key_name=None, security_groups=None,
     block_device_map
         (boto.ec2.blockdevicemapping.BlockDeviceMapping) – A BlockDeviceMapping
         data structure describing the EBS volumes associated with the Image.
+        (string) - A string representation of a BlockDeviceMapping structure
+        (dict) - A dict describing a BlockDeviceMapping structure
+        YAML example:
+        .. code-block:: yaml
+            device-maps:
+                /dev/sdb:
+                    ephemeral_name: ephemeral0
+                /dev/sdc:
+                    ephemeral_name: ephemeral1
+                /dev/sdd:
+                    ephemeral_name: ephemeral2
+                /dev/sde:
+                    ephemeral_name: ephemeral3
+                /dev/sdf:
+                    size: 20
+                    volume_type: gp2
     disable_api_termination
         (bool) – If True, the instances will be locked and will not be able to
         be terminated via the API.
@@ -678,6 +941,10 @@ def run(image_id, name=None, tags=None, key_name=None, security_groups=None,
         (boto.ec2.networkinterface.NetworkInterfaceCollection) – A
         NetworkInterfaceCollection data structure containing the ENI
         specifications for the instance.
+    network_interface_id
+        (string) - ID of the network interface to attach to the instance
+    network_interface_name
+        (string) - Name of the network interface to attach to the instance
 
     '''
     if all((subnet_id, subnet_name)):
@@ -706,20 +973,49 @@ def run(image_id, name=None, tags=None, key_name=None, security_groups=None,
                 return False
             security_group_ids += [r]
 
+    if all((network_interface_id, network_interface_name)):
+        raise SaltInvocationError('Only one of network_interface_id or '
+                                  'network_interface_name may be provided.')
+    if network_interface_name:
+        result = get_network_interface_id(network_interface_name,
+                                                        region=region, key=key,
+                                                        keyid=keyid,
+                                                        profile=profile)
+        network_interface_id = result['result']
+        if not network_interface_id:
+            log.warning(
+                "Given network_interface_name '{0}' cannot be mapped to an "
+                "network_interface_id".format(network_interface_name)
+            )
+
+    if network_interface_id:
+        interface = boto.ec2.networkinterface.NetworkInterfaceSpecification(
+            network_interface_id=network_interface_id,
+            device_index=0
+        )
+    else:
+        interface = boto.ec2.networkinterface.NetworkInterfaceSpecification(
+            subnet_id=subnet_id,
+            groups=security_group_ids,
+            device_index=0
+        )
+    interfaces = boto.ec2.networkinterface.NetworkInterfaceCollection(interface)
+
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
 
     reservation = conn.run_instances(image_id, key_name=key_name, security_groups=security_groups,
                                      user_data=user_data, instance_type=instance_type,
                                      placement=placement, kernel_id=kernel_id, ramdisk_id=ramdisk_id,
-                                     monitoring_enabled=monitoring_enabled, subnet_id=subnet_id,
-                                     private_ip_address=private_ip_address, block_device_map=block_device_map,
+                                     monitoring_enabled=monitoring_enabled,
+                                     private_ip_address=private_ip_address,
+                                     block_device_map=_to_blockdev_map(block_device_map),
                                      disable_api_termination=disable_api_termination,
                                      instance_initiated_shutdown_behavior=instance_initiated_shutdown_behavior,
                                      placement_group=placement_group, client_token=client_token,
-                                     security_group_ids=security_group_ids, additional_info=additional_info,
+                                     additional_info=additional_info,
                                      tenancy=tenancy, instance_profile_arn=instance_profile_arn,
                                      instance_profile_name=instance_profile_name, ebs_optimized=ebs_optimized,
-                                     network_interfaces=network_interfaces)
+                                     network_interfaces=interfaces)
     if not reservation:
         log.warning('Instance could not be reserved')
         return False
@@ -774,7 +1070,7 @@ def create_key(key_name, save_path, region=None, key=None, keyid=None,
 
     .. code-block:: bash
 
-        salt myminion boto_ec2.create mykey /root/
+        salt myminion boto_ec2.create_key mykey /root/
     '''
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
 
@@ -871,7 +1167,7 @@ def get_keys(keynames=None, filters=None, region=None, key=None,
 
 
 def get_attribute(attribute, instance_name=None, instance_id=None, region=None, key=None,
-                  keyid=None, profile=None):
+                  keyid=None, profile=None, filters=None):
     '''
     Get an EC2 instance attribute.
 
@@ -879,7 +1175,7 @@ def get_attribute(attribute, instance_name=None, instance_id=None, region=None, 
 
     .. code-block:: bash
 
-        salt myminion boto_ec2.get_attribute name=my_instance attribute=sourceDestCheck
+        salt myminion boto_ec2.get_attribute sourceDestCheck instance_name=my_instance
 
     Available attributes:
         * instanceType
@@ -910,7 +1206,8 @@ def get_attribute(attribute, instance_name=None, instance_id=None, region=None, 
         raise SaltInvocationError('Attribute must be one of: {0}.'.format(attribute_list))
     try:
         if instance_name:
-            instances = find_instances(name=instance_name, region=region, key=key, keyid=keyid, profile=profile)
+            instances = find_instances(name=instance_name, region=region, key=key, keyid=keyid, profile=profile,
+                                      filters=filters)
             if len(instances) > 1:
                 log.error('Found more than one EC2 instance matching the criteria.')
                 return False
@@ -928,7 +1225,7 @@ def get_attribute(attribute, instance_name=None, instance_id=None, region=None, 
 
 
 def set_attribute(attribute, attribute_value, instance_name=None, instance_id=None, region=None, key=None, keyid=None,
-                  profile=None):
+                  profile=None, filters=None):
     '''
     Set an EC2 instance attribute.
     Returns whether the operation succeeded or not.
@@ -937,8 +1234,7 @@ def set_attribute(attribute, attribute_value, instance_name=None, instance_id=No
 
     .. code-block:: bash
 
-        salt myminion boto_ec2.set_attribute instance_name=my_instance \
-                attribute=sourceDestCheck attribute_value=False
+        salt myminion boto_ec2.set_attribute sourceDestCheck False instance_name=my_instance
 
     Available attributes:
         * instanceType
@@ -968,7 +1264,8 @@ def set_attribute(attribute, attribute_value, instance_name=None, instance_id=No
         raise SaltInvocationError('Attribute must be one of: {0}.'.format(attribute_list))
     try:
         if instance_name:
-            instances = find_instances(name=instance_name, region=region, key=key, keyid=keyid, profile=profile)
+            instances = find_instances(name=instance_name, region=region, key=key, keyid=keyid, profile=profile,
+                                      filters=filters)
             if len(instances) != 1:
                 raise CommandExecutionError('Found more than one EC2 instance matching the criteria.')
             instance_id = instances[0]
@@ -986,7 +1283,7 @@ def get_network_interface_id(name, region=None, key=None, keyid=None,
     '''
     Get an Elastic Network Interface id from its name tag.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -1015,7 +1312,7 @@ def get_network_interface(name=None, network_interface_id=None, region=None,
     '''
     Get an Elastic Network Interface.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -1088,13 +1385,14 @@ def _describe_network_interface(eni):
     return r
 
 
-def create_network_interface(
-        name, subnet_id, private_ip_address=None, description=None,
-        groups=None, region=None, key=None, keyid=None, profile=None):
+def create_network_interface(name, subnet_id=None, subnet_name=None,
+                             private_ip_address=None, description=None,
+                             groups=None, region=None, key=None, keyid=None,
+                             profile=None):
     '''
     Create an Elastic Network Interface.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -1102,6 +1400,21 @@ def create_network_interface(
 
         salt myminion boto_ec2.create_network_interface my_eni subnet-12345 description=my_eni groups=['my_group']
     '''
+    if not salt.utils.exactly_one((subnet_id, subnet_name)):
+        raise SaltInvocationError('One (but not both) of subnet_id or '
+                                  'subnet_name must be provided.')
+
+    if subnet_name:
+        resource = __salt__['boto_vpc.get_resource_id']('subnet', subnet_name,
+                                                        region=region, key=key,
+                                                        keyid=keyid,
+                                                        profile=profile)
+        if 'id' not in resource:
+            log.warning('Couldn\'t resolve subnet name {0}.').format(
+                subnet_name)
+            return False
+        subnet_id = resource['id']
+
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
     r = {}
     result = _get_network_interface(conn, name)
@@ -1141,7 +1454,7 @@ def delete_network_interface(
     '''
     Create an Elastic Network Interface.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -1172,28 +1485,32 @@ def delete_network_interface(
     return r
 
 
-def attach_network_interface(
-        name=None, network_interface_id=None, instance_id=None,
-        device_index=None, region=None, key=None, keyid=None, profile=None):
+def attach_network_interface(device_index, name=None, network_interface_id=None,
+                             instance_name=None, instance_id=None,
+                             region=None, key=None, keyid=None, profile=None):
     '''
     Attach an Elastic Network Interface.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt myminion boto_ec2.create_network_interface my_eni subnet-12345 description=my_eni groups=['my_group']
+        salt myminion boto_ec2.attach_network_interface my_eni instance_name=salt-master device_index=0
     '''
-    if not (name or network_interface_id):
+    if not salt.utils.exactly_one((name, network_interface_id)):
         raise SaltInvocationError(
-            'Either name or network_interface_id must be provided.'
+            "Exactly one (but not both) of 'name' or 'network_interface_id' "
+            "must be provided."
         )
-    if not (instance_id and device_index):
+
+    if not salt.utils.exactly_one((instance_name, instance_id)):
         raise SaltInvocationError(
-            'instance_id and device_index are required parameters.'
+            "Exactly one (but not both) of 'instance_name' or 'instance_id' "
+            "must be provided."
         )
+
     conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
     r = {}
     result = _get_network_interface(conn, name, network_interface_id)
@@ -1206,6 +1523,15 @@ def attach_network_interface(
     except KeyError:
         r['error'] = {'message': 'ID not found for this network interface.'}
         return r
+
+    if instance_name:
+        try:
+            instance_id = get_id(name=instance_name, region=region, key=key,
+                                 keyid=keyid, profile=profile)
+        except boto.exception.BotoServerError as e:
+            log.error(e)
+            return False
+
     try:
         r['result'] = conn.attach_network_interface(
             network_interface_id, instance_id, device_index
@@ -1221,7 +1547,7 @@ def detach_network_interface(
     '''
     Detach an Elastic Network Interface.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -1260,7 +1586,7 @@ def modify_network_interface_attribute(
     '''
     Modify an attribute of an Elastic Network Interface.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -1323,3 +1649,322 @@ def modify_network_interface_attribute(
     except boto.exception.EC2ResponseError as e:
         r['error'] = __utils__['boto.get_error'](e)
     return r
+
+
+def get_all_volumes(volume_ids=None, filters=None, return_objs=False,
+                    region=None, key=None, keyid=None, profile=None):
+    '''
+    Get a list of all EBS volumes, optionally filtered by provided 'filters' param
+
+    .. versionadded:: 2016.11.0
+
+    volume_ids
+        (list) - Optional list of volume_ids.  If provided, only the volumes
+        associated with those in the list will be returned.
+    filters
+        (dict) - Additional constraints on which volumes to return.  Valid filters are:
+            attachment.attach-time - The time stamp when the attachment initiated.
+            attachment.delete-on-termination - Whether the volume is deleted on instance termination.
+            attachment.device - The device name that is exposed to the instance (for example, /dev/sda1).
+            attachment.instance-id - The ID of the instance the volume is attached to.
+            attachment.status - The attachment state (attaching | attached | detaching | detached).
+            availability-zone - The Availability Zone in which the volume was created.
+            create-time - The time stamp when the volume was created.
+            encrypted - The encryption status of the volume.
+            size - The size of the volume, in GiB.
+            snapshot-id - The snapshot from which the volume was created.
+            status - The status of the volume (creating | available | in-use | deleting | deleted | error).
+            tag:key=value - The key/value combination of a tag assigned to the resource.
+            volume-id - The volume ID.
+            volume-type - The Amazon EBS volume type. This can be gp2 for General Purpose SSD, io1 for
+                          Provisioned IOPS SSD, st1 for Throughput Optimized HDD, sc1 for Cold HDD, or
+                          standard for Magnetic volumes.
+    return_objs
+        (bool) - Changes the return type from list of volume IDs to list of boto.ec2.volume.Volume objects
+
+    returns
+        (list) - A list of the requested values:  Either the volume IDs; or, if return_objs is true,
+                 boto.ec2.volume.Volume objects.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-call boto_ec2.get_all_volumes filters='{"tag:Name": "myVolume01"}'
+
+    '''
+    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
+
+    try:
+        ret = conn.get_all_volumes(volume_ids=volume_ids, filters=filters)
+        return ret if return_objs else [r.id for r in ret]
+    except boto.exception.BotoServerError as e:
+        log.error(e)
+        return []
+
+
+def set_volumes_tags(tag_maps, authoritative=False, dry_run=False,
+                    region=None, key=None, keyid=None, profile=None):
+    '''
+    .. versionadded:: 2016.11.0
+
+    tag_maps (list)
+        List of dicts of filters and tags, where 'filters' is a dict suitable for passing to the
+        'filters' argument of get_all_volumes() above, and 'tags' is a dict of tags to be set on
+        volumes (via create_tags/delete_tags) as matched by the given filters.  The filter syntax
+        is extended to permit passing either a list of volume_ids or an instance_name (with
+        instance_name being the Name tag of the instance to which the desired volumes are mapped).
+        Each mapping in the list is applied separately, so multiple sets of volumes can be all
+        tagged differently with one call to this function.  If filtering by instance Name, You may
+        additionally limit the instances matched by passing in a list of desired instance states.
+        The default set of states is ('pending', 'rebooting', 'running', 'stopping', 'stopped').
+
+    YAML example fragment:
+
+    .. code-block:: yaml
+        - filters:
+            attachment.instance_id: i-abcdef12
+          tags:
+            Name: dev-int-abcdef12.aws-foo.com
+        - filters:
+            attachment.device: /dev/sdf
+          tags:
+            ManagedSnapshots: true
+            BillingGroup: bubba.hotep@aws-foo.com
+          in_states:
+          - stopped
+          - terminated
+        - filters:
+            instance_name: prd-foo-01.aws-foo.com
+          tags:
+            Name: prd-foo-01.aws-foo.com
+            BillingGroup: infra-team@aws-foo.com
+        - filters:
+            volume_ids: [ vol-12345689, vol-abcdef12 ]
+          tags:
+            BillingGroup: infra-team@aws-foo.com
+
+    authoritative (bool)
+        If true, any existing tags on the matched volumes, and not explicitly requested here, will
+        be removed.
+
+    dry_run (bool)
+        If true, don't change anything, just return a dictionary describing any changes which
+        would have been applied.
+
+    returns (dict)
+        A dict dsecribing status and any changes.
+
+    '''
+    ret = {'success': True, 'comment': '', 'changes': {}}
+    running_states = ('pending', 'rebooting', 'running', 'stopping', 'stopped')
+    for tm in tag_maps:
+        filters = tm.get('filters')
+        tags = tm.get('tags')
+        if not isinstance(filters, dict):
+            raise SaltInvocationError('Tag filters must be a dictionary: got {0}'.format(filters))
+        if not isinstance(tags, dict):
+            raise SaltInvocationError('Tags must be a dictionary: got {0}'.format(tags))
+        args = {'return_objs': True, 'region': region, 'key': key, 'keyid': keyid, 'profile': profile}
+        new_filters = {}
+        log.debug('got filters: {0}'.format(filters))
+        instance_id = None
+        in_states = tm.get('in_states', running_states)
+        try:
+            for k, v in six.iteritems(filters):
+                if k == 'volume_ids':
+                    args['volume_ids'] = v
+                elif k == 'instance_name':
+                    instance_id = get_id(name=v, in_states=in_states, region=region, key=key,
+                                         keyid=keyid, profile=profile)
+                    if not instance_id:
+                        msg = "Couldn't resolve instance Name {0} to an ID.".format(v)
+                        raise CommandExecutionError(msg)
+                    new_filters['attachment.instance_id'] = instance_id
+                else:
+                    new_filters[k] = v
+        except CommandExecutionError as e:
+            log.warning(e)
+            continue  # Hmme, abort or do what we can...?  Guess the latter for now.
+        args['filters'] = new_filters
+        volumes = get_all_volumes(**args)
+        log.debug('got volume list: {0}'.format(volumes))
+        changes = {'old': {}, 'new': {}}
+        for vol in volumes:
+            log.debug('current tags on vol.id {0}: {1}'.format(vol.id, dict(getattr(vol, 'tags', {}))))
+            curr = set(dict(getattr(vol, 'tags', {})).keys())
+            log.debug('requested tags on vol.id {0}: {1}'.format(vol.id, tags))
+            req = set(tags.keys())
+            add = list(req - curr)
+            update = [r for r in (req & curr) if vol.tags[r] != tags[r]]
+            remove = list(curr - req)
+            if add or update or (authoritative and remove):
+                changes['old'][vol.id] = dict(getattr(vol, 'tags', {}))
+                changes['new'][vol.id] = tags
+            else:
+                log.debug('No changes needed for vol.id {0}'.format(vol.id))
+            if len(add):
+                d = dict((k, tags[k]) for k in add)
+                log.debug('New tags for vol.id {0}: {1}'.format(vol.id, d))
+            if len(update):
+                d = dict((k, tags[k]) for k in update)
+                log.debug('Updated tags for vol.id {0}: {1}'.format(vol.id, d))
+            if not dry_run:
+                if not create_tags(vol.id, tags, region=region, key=key, keyid=keyid, profile=profile):
+                    ret['success'] = False
+                    ret['comment'] = "Failed to set tags on vol.id {0}: {1}".format(vol.id, tags)
+                    return ret
+                if authoritative:
+                    if len(remove):
+                        log.debug('Removed tags for vol.id {0}: {1}'.format(vol.id, remove))
+                        if not delete_tags(vol.id, remove, region=region, key=key, keyid=keyid, profile=profile):
+                            ret['success'] = False
+                            ret['comment'] = "Failed to remove tags on vol.id {0}: {1}".format(vol.id, remove)
+                            return ret
+        ret['changes'].update(changes) if changes['old'] or changes['new'] else None  # pylint: disable=W0106
+    return ret
+
+
+def create_tags(resource_ids, tags, region=None, key=None, keyid=None, profile=None):
+    '''
+    Create new metadata tags for the specified resource ids.
+
+    .. versionadded:: 2016.11.0
+
+    resource_ids
+        (string) or (list) – List of resource IDs.  A plain string will be converted to a list of one element.
+    tags
+        (dict) – Dictionary of name/value pairs. To create only a tag name, pass '' as the value.
+
+    returns
+        (bool) - True on success, False on failure.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-call boto_ec2.create_tags vol-12345678 '{"Name": "myVolume01"}'
+
+    '''
+    if not isinstance(resource_ids, list):
+        resource_ids = [resource_ids]
+
+    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
+    try:
+        conn.create_tags(resource_ids, tags)
+        return True
+    except boto.exception.BotoServerError as e:
+        log.error(e)
+        return False
+
+
+def delete_tags(resource_ids, tags, region=None, key=None, keyid=None, profile=None):
+    '''
+    Delete metadata tags for the specified resource ids.
+
+    .. versionadded:: 2016.11.0
+
+    resource_ids
+        (string) or (list) – List of resource IDs.  A plain string will be converted to a list of one element.
+    tags
+        (dict) or (list) – Either a dictionary containing name/value pairs or a list containing just tag names.
+                           If you pass in a dictionary, the values must match the actual tag values or the tag
+                           will not be deleted. If you pass in a value of None for the tag value, all tags with
+                           that name will be deleted.
+
+    returns
+        (bool) - True on success, False on failure.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-call boto_ec2.delete_tags vol-12345678 '{"Name": "myVolume01"}'
+        salt-call boto_ec2.delete_tags vol-12345678 '["Name","MountPoint"]'
+
+    '''
+    if not isinstance(resource_ids, list):
+        resource_ids = [resource_ids]
+
+    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
+    try:
+        conn.delete_tags(resource_ids, tags)
+        return True
+    except boto.exception.BotoServerError as e:
+        log.error(e)
+        return False
+
+
+def detach_volume(volume_id, instance_id=None, device=None, force=False,
+                  region=None, key=None, keyid=None, profile=None):
+    '''
+    Detach an EBS volume from an EC2 instance.
+
+    .. versionadded:: 2016.11.0
+
+    volume_id
+        (string) – The ID of the EBS volume to be detached.
+    instance_id
+        (string) – The ID of the EC2 instance from which it will be detached.
+    device
+        (string) – The device on the instance through which the volume is exposted (e.g. /dev/sdh)
+    force
+        (bool) – Forces detachment if the previous detachment attempt did not occur cleanly.
+                 This option can lead to data loss or a corrupted file system. Use this option
+                 only as a last resort to detach a volume from a failed instance. The instance
+                 will not have an opportunity to flush file system caches nor file system meta data.
+                 If you use this option, you must perform file system check and repair procedures.
+
+    returns
+        (bool) - True on success, False on failure.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-call boto_ec2.detach_volume vol-12345678 i-87654321
+
+    '''
+    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
+    try:
+        return conn.detach_volume(volume_id, instance_id, device, force)
+    except boto.exception.BotoServerError as e:
+        log.error(e)
+        return False
+
+
+def delete_volume(volume_id, instance_id=None, device=None, force=False,
+                  region=None, key=None, keyid=None, profile=None):
+    '''
+    Detach an EBS volume from an EC2 instance.
+
+    .. versionadded:: 2016.11.0
+
+    volume_id
+        (string) – The ID of the EBS volume to be deleted.
+    force
+        (bool) – Forces deletion even if the device has not yet been detached from its instance.
+
+    returns
+        (bool) - True on success, False on failure.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-call boto_ec2.delete_volume vol-12345678
+
+    '''
+    conn = _get_conn(region=region, key=key, keyid=keyid, profile=profile)
+    try:
+        return conn.delete_volume(volume_id)
+    except boto.exception.BotoServerError as e:
+        if not force:
+            log.error(e)
+            return False
+    try:
+        conn.detach_volume(volume_id, force=force)
+        return conn.delete_volume(volume_id)
+    except boto.exception.BotoServerError as e:
+        log.error(e)
+        return False

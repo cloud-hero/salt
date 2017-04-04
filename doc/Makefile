@@ -154,7 +154,7 @@ pdf: translations
 
 cheatsheet: translations
 	@echo "Running cheatsheet/salt.tex file through xelatex..."
-	cd cheatsheet &&  xelatex salt.tex && cp salt.pdf ../salt-cheatsheet.pdf 
+	cd cheatsheet &&  xelatex salt.tex && cp salt.pdf ../salt-cheatsheet.pdf
 	@echo "./salt-cheatsheet.pdf created."
 
 text: translations
@@ -216,7 +216,6 @@ pseudoxml: translations
 	$(SPHINXBUILD) -b pseudoxml $(ALLSPHINXOPTS) $(BUILDDIR)/pseudoxml
 	@echo
 	@echo "Build finished. The pseudo-XML files are in $(BUILDDIR)/pseudoxml."
-
 
 translations:
 	@if [ "$(SPHINXLANG)" = "en" ] || [ "x$(SPHINXLANG)" = "x" ]; then \

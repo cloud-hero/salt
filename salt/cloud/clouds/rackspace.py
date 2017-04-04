@@ -55,6 +55,9 @@ import salt.utils.cloud
 # Import Third Party Libs
 try:
     from libcloud.compute.base import NodeState
+    # See https://github.com/saltstack/salt/issues/32743
+    import libcloud.security
+    libcloud.security.CA_CERTS_PATH.append('/etc/ssl/certs/YaST-CA.pem')
     HAS_LIBCLOUD = True
 except ImportError:
     HAS_LIBCLOUD = False
@@ -194,25 +197,18 @@ def create(vm_):
         # Check for required profile parameters before sending any API calls.
         if vm_['profile'] and config.is_profile_configured(__opts__,
                                                            __active_provider_name__ or 'rackspace',
-                                                           vm_['profile']) is False:
+                                                           vm_['profile'],
+                                                           vm_=vm_) is False:
             return False
     except AttributeError:
         pass
 
-    # Since using "provider: <provider-engine>" is deprecated, alias provider
-    # to use driver: "driver: <provider-engine>"
-    if 'provider' in vm_:
-        vm_['driver'] = vm_.pop('provider')
-
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'starting create',
         'salt/cloud/{0}/creating'.format(vm_['name']),
-        {
-            'name': vm_['name'],
-            'profile': vm_['profile'],
-            'provider': vm_['driver'],
-        },
+        args=__utils__['cloud.filter_event']('creating', vm_, ['name', 'profile', 'provider', 'driver']),
+        sock_dir=__opts__['sock_dir'],
         transport=__opts__['transport']
     )
 
@@ -224,13 +220,20 @@ def create(vm_):
         'size': get_size(conn, vm_)
     }
 
-    salt.utils.cloud.fire_event(
+    event_kwargs = {
+        'name': kwargs['name'],
+        'image': kwargs['image'].name,
+        'size': kwargs['size'].name,
+    }
+
+    __utils__['cloud.fire_event'](
         'event',
         'requesting instance',
         'salt/cloud/{0}/requesting'.format(vm_['name']),
-        {'kwargs': {'name': kwargs['name'],
-                    'image': kwargs['image'].name,
-                    'size': kwargs['size'].name}},
+        args={
+            'kwargs': __utils__['cloud.filter_event']('requesting', event_kwargs, event_kwargs.keys()),
+        },
+        sock_dir=__opts__['sock_dir'],
         transport=__opts__['transport']
     )
 
@@ -279,17 +282,19 @@ def create(vm_):
         public = node['public_ips']
 
         if private and not public:
-            log.warn(
+            log.warning(
                 'Private IPs returned, but not public... Checking for '
                 'misidentified IPs'
             )
             for private_ip in private:
                 private_ip = preferred_ip(vm_, [private_ip])
+                if private_ip is False:
+                    continue
                 if salt.utils.cloud.is_public_ip(private_ip):
-                    log.warn('{0} is a public IP'.format(private_ip))
+                    log.warning('{0} is a public IP'.format(private_ip))
                     data.public_ips.append(private_ip)
                 else:
-                    log.warn('{0} is a private IP'.format(private_ip))
+                    log.warning('{0} is a private IP'.format(private_ip))
                     if private_ip not in data.private_ips:
                         data.private_ips.append(private_ip)
 
@@ -347,7 +352,7 @@ def create(vm_):
     vm_['ssh_host'] = ip_address
     vm_['password'] = data.extra['password']
 
-    ret = salt.utils.cloud.bootstrap(vm_, __opts__)
+    ret = __utils__['cloud.bootstrap'](vm_, __opts__)
 
     ret.update(data.__dict__)
 
@@ -361,15 +366,12 @@ def create(vm_):
         )
     )
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'created instance',
         'salt/cloud/{0}/created'.format(vm_['name']),
-        {
-            'name': vm_['name'],
-            'profile': vm_['profile'],
-            'provider': vm_['driver'],
-        },
+        args=__utils__['cloud.filter_event']('created', vm_, ['name', 'profile', 'provider', 'driver']),
+        sock_dir=__opts__['sock_dir'],
         transport=__opts__['transport']
     )
 

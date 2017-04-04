@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 '''
 Manage the password database on BSD systems
+
+.. important::
+    If you feel that Salt should be using this module to manage passwords on a
+    minion, and it is using a different module (or gives an error similar to
+    *'shadow.info' is not available*), see :ref:`here
+    <module-provider-override>`.
 '''
 
 # Import python libs
@@ -20,7 +26,10 @@ __virtualname__ = 'shadow'
 
 
 def __virtual__():
-    return __virtualname__ if 'BSD' in __grains__.get('os', '') else False
+    if 'BSD' in __grains__.get('os', ''):
+        return __virtualname__
+    return (False, 'The bsd_shadow execution module cannot be loaded: '
+            'only available on BSD family systems.')
 
 
 def default_hash():
@@ -70,7 +79,9 @@ def info(name):
             with salt.utils.fopen('/etc/master.passwd', 'r') as fp_:
                 for line in fp_:
                     if line.startswith('{0}:'.format(name)):
-                        change, expire = line.rstrip('\n')[5:7]
+                        key = line.split(':')
+                        change, expire = key[5:7]
+                        ret['passwd'] = str(key[1])
                         break
         except IOError:
             change = expire = None
@@ -142,6 +153,24 @@ def set_expire(name, expire):
     post_info = info(name)
     if post_info['expire'] != pre_info['expire']:
         return post_info['expire'] == expire
+
+
+def del_password(name):
+    '''
+    .. versionadded:: 2015.8.2
+
+    Delete the password from name user
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' shadow.del_password username
+    '''
+    cmd = 'pw user mod {0} -w none'.format(name)
+    __salt__['cmd.run'](cmd, python_shell=False, output_loglevel='quiet')
+    uinfo = info(name)
+    return not uinfo['passwd']
 
 
 def set_password(name, password):

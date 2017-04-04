@@ -4,7 +4,7 @@ Module for managing Infoblox
 
 Will look for pillar data infoblox:server, infoblox:user, infoblox:password if not passed to functions
 
-.. versionadded:: Boron
+.. versionadded:: 2016.3.0
 
 :depends:
         - requests
@@ -29,7 +29,8 @@ except ImportError:
 def __virtual__():
     if HAS_IMPORTS:
         return True
-    return False
+    return (False, 'The infoblox execution module cannot be loaded: '
+            'python requests and/or json libraries are not available.')
 
 
 def _conn_info_check(infoblox_server=None,
@@ -62,7 +63,7 @@ def _process_return_data(retData):
             return None
     else:
         msg = 'Unsuccessful error code {0} returned'.format(retData.status_code)
-        log.error(msg)
+        raise CommandExecutionError(msg)
     return None
 
 
@@ -96,7 +97,7 @@ def delete_record(name,
         the infoblox user's password (can also use the infolblox:password pillar)
 
     infoblox_api_version
-        the infoblox api verison to use
+        the infoblox api version to use
 
     sslVerify
         should ssl verification be done on the connection to the Infoblox REST API
@@ -114,6 +115,7 @@ def delete_record(name,
         _throw_no_creds()
         return None
 
+    record_type = record_type.lower()
     currentRecords = get_record(name,
                                 record_type,
                                 infoblox_server,
@@ -173,7 +175,7 @@ def update_record(name,
         the infoblox user's password (can also use the infolblox:password pillar)
 
     infoblox_api_version
-        the infoblox api verison to use
+        the infoblox api version to use
 
     sslVerify
         should ssl verification be done on the connection to the Infoblox REST API
@@ -192,6 +194,7 @@ def update_record(name,
         _throw_no_creds()
         return None
 
+    record_type = record_type.lower()
     currentRecords = get_record(name,
                                 record_type,
                                 infoblox_server,
@@ -210,6 +213,8 @@ def update_record(name,
             if record_type == 'cname':
                 data = json.dumps({'canonical': value})
             elif record_type == 'a':
+                data = json.dumps({'ipv4addr': value})
+            elif record_type == 'host':
                 data = {'ipv4addrs': []}
                 for i in value:
                     data['ipv4addrs'].append({'ipv4addr': i})
@@ -265,7 +270,7 @@ def add_record(name,
         the infoblox user's password (can also use the infolblox:password pillar)
 
     infoblox_api_version
-        the infoblox api verison to use
+        the infoblox api version to use
 
     sslVerify
         should ssl verification be done on the connection to the Infoblox REST API
@@ -290,28 +295,13 @@ def add_record(name,
     url = None
     if record_type == 'cname':
         data = json.dumps({'name': name, 'canonical': value, 'view': dns_view})
-    if record_type == 'host' or record_type == 'a':
+        log.debug('cname data {0}'.format(data))
+    elif record_type == 'host':
         data = json.dumps({'name': name, 'ipv4addrs': [{'ipv4addr': value}], 'view': dns_view})
-    #if record_type == 'alias':
-    #    data = json.dumps({'name': name, 'aliases': [value], 'view': dns_view})
-    #    record_type = 'host'
-    #    tRec = get_record(name,
-    #        record_type,
-    #        infoblox_server,
-    #        infoblox_user,
-    #        infoblox_password,
-    #        dns_view,
-    #        infoblox_api_version,
-    #        sslVerify)
-    #    if not tRec:
-    #        log.error('A host record matching {0} was not found to add the alias to.'.format(name))
-    #        return False
-    #    else:
-    #        for _rec in tRec:
-    #            url = 'https://{0}/wapi/{1}/{2}'.format(
-    #                infoblox_server,
-    #                infoblox_api_version,
-    #                _rec['Record ID'])
+        log.debug('host record data {0}'.format(data))
+    elif record_type == 'a':
+        data = json.dumps({'name': name, 'ipv4addr': value, 'view': dns_view})
+        log.debug('a record data {0}'.format(data))
 
     url = 'https://{0}/wapi/{1}/record:{2}'.format(infoblox_server,
                                                    infoblox_api_version,
@@ -363,7 +353,7 @@ def get_network(network_name,
         the infoblox user's password (can also use the infolblox:password pillar)
 
     infoblox_api_version
-        the infoblox api verison to use
+        the infoblox api version to use
 
     sslVerify
         should ssl verification be done on the connection to the Infoblox REST API
@@ -397,7 +387,7 @@ def get_network(network_name,
             log.debug('Infoblox record returned: {0}'.format(entry))
             tEntry = {}
             data = _parse_record_data(entry)
-            for key in data.keys():
+            for key in data:
                 tEntry[key] = data[key]
             records.append(tEntry)
         return records
@@ -436,7 +426,7 @@ def get_record(record_name,
         the infoblox DNS view to search, if not specified all views are searched
 
     infoblox_api_version
-        the infoblox api verison to use
+        the infoblox api version to use
 
     sslVerify
         should ssl verification be done on the connection to the Infoblox REST API
@@ -448,13 +438,14 @@ def get_record(record_name,
         salt myminion infoblox.get_record some.host.com A sslVerify=False
     '''
 
-    #TODO - verify record type (A, AAAA, CNAME< HOST, MX, PTR, SVR, TXT, host_ipv4addr, host_ipv6addr, naptr)
+    # TODO - verify record type (A, AAAA, CNAME< HOST, MX, PTR, SVR, TXT, host_ipv4addr, host_ipv6addr, naptr)
     records = []
 
     infoblox_server, infoblox_user, infoblox_password = _conn_info_check(infoblox_server,
                                                                          infoblox_user,
                                                                          infoblox_password)
 
+    record_type = record_type.lower()
     if infoblox_server is None and infoblox_user is None and infoblox_password is None:
         _throw_no_creds()
         return None
@@ -476,7 +467,7 @@ def get_record(record_name,
             log.debug('Infoblox record returned: {0}'.format(entry))
             tEntry = {}
             data = _parse_record_data(entry)
-            for key in data.keys():
+            for key in data:
                 tEntry[key] = data[key]
             records.append(tEntry)
         return records
@@ -499,6 +490,8 @@ def _parse_record_data(entry_data):
         for ipaddrs in entry_data['ipv4addrs']:
             ipv4addrs.append(ipaddrs['ipv4addr'])
         ret['IP Addresses'] = ipv4addrs
+    if 'ipv4addr' in entry_data:
+        ret['IP Address'] = entry_data['ipv4addr']
     if 'aliases' in entry_data:
         for alias in entry_data['aliases']:
             aliases.append(alias)

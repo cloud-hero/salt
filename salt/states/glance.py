@@ -9,15 +9,35 @@ import logging
 import time
 
 # Import salt libs
-from salt.utils import warn_until
 
 # Import OpenStack libs
-from keystoneclient.apiclient.exceptions import \
-    Unauthorized as kstone_Unauthorized
-from glanceclient.exc import \
-    HTTPUnauthorized as glance_Unauthorized
+try:
+    from keystoneclient.exceptions import \
+        Unauthorized as kstone_Unauthorized
+    HAS_KEYSTONE = True
+except ImportError:
+    try:
+        from keystoneclient.apiclient.exceptions import \
+            Unauthorized as kstone_Unauthorized
+        HAS_KEYSTONE = True
+    except ImportError:
+        HAS_KEYSTONE = False
+
+try:
+    from glanceclient.exc import \
+        HTTPUnauthorized as glance_Unauthorized
+    HAS_GLANCE = True
+except ImportError:
+    HAS_GLANCE = False
 
 log = logging.getLogger(__name__)
+
+
+def __virtual__():
+    '''
+    Only load if dependencies are loaded
+    '''
+    return HAS_KEYSTONE and HAS_GLANCE
 
 
 def _find_image(name):
@@ -28,33 +48,31 @@ def _find_image(name):
         - False, 'Found more than one image with given name'
     '''
     try:
-        images_dict = __salt__['glance.image_list'](name=name)
+        images = __salt__['glance.image_list'](name=name)
     except kstone_Unauthorized:
         return False, 'keystoneclient: Unauthorized'
     except glance_Unauthorized:
         return False, 'glanceclient: Unauthorized'
-    log.debug('Got images_dict: {0}'.format(images_dict))
+    log.debug('Got images: {0}'.format(images))
 
-    warn_until('Boron', 'Starting with Boron '
-        '\'glance.image_list\' is not supposed to return '
-        'the images wrapped in a separate dict anymore.')
-    if len(images_dict) == 1 and 'images' in images_dict:
-        images_dict = images_dict['images']
+    if type(images) is dict and len(images) == 1 and 'images' in images:
+        images = images['images']
 
-    # I /think/ this will still work when glance.image_list
-    # starts returning a list instead of a dictionary...
-    if len(images_dict) == 0:
+    images_list = images.values() if type(images) is dict else images
+
+    if len(images_list) == 0:
         return None, 'No image with name "{0}"'.format(name)
-    elif len(images_dict) == 1:
-        return images_dict.values()[0], 'Found image {0}'.format(name)
-    elif len(images_dict) > 1:
+    elif len(images_list) == 1:
+        return images_list[0], 'Found image {0}'.format(name)
+    elif len(images_list) > 1:
         return False, 'Found more than one image with given name'
     else:
         raise NotImplementedError
 
 
 def image_present(name, visibility='public', protected=None,
-        checksum=None, location=None, wait_for=None, timeout=30):
+        checksum=None, location=None, disk_format='raw', wait_for=None,
+        timeout=30):
     '''
     Checks if given image is present with properties
     set as specified.
@@ -73,6 +91,8 @@ def image_present(name, visibility='public', protected=None,
       - protected (bool)
       - checksum (string, md5sum)
       - location (URL, to copy from)
+      - disk_format ('raw' (default), 'vhd', 'vhdx', 'vmdk', 'vdi', 'iso',
+        'qcow2', 'aki', 'ari' or 'ami')
     '''
     ret = {'name': name,
             'changes': {},
@@ -111,13 +131,7 @@ def image_present(name, visibility='public', protected=None,
             return ret
         image = __salt__['glance.image_create'](name=name,
             protected=protected, visibility=visibility,
-            location=location)
-        # See Salt issue #24568
-        warn_until('Boron', 'Starting with Boron '
-            '\'glance.image_create\' is not supposed to return '
-            'the image wrapped in a dict anymore.')
-        if len(image.keys()) == 1:
-            image = image.values()[0]
+            location=location, disk_format=disk_format)
         log.debug('Created new image:\n{0}'.format(image))
         ret['changes'] = {
             name:
@@ -147,25 +161,11 @@ def image_present(name, visibility='public', protected=None,
                     ret['comment'] += 'Created image {0} '.format(
                         name) + ' vanished:\n' + msg
                     return ret
-                elif len(image.keys()) == 1:
-                    # See Salt issue #24568
-                    warn_until('Boron', 'Starting with Boron '
-                        '\'_find_image()\' is not supposed to return '
-                        'the image wrapped in a dict anymore.')
-                    image = image.values()[0]
         if timer <= 0 and image['status'] not in acceptable:
             ret['result'] = False
             ret['comment'] += 'Image didn\'t reach an acceptable '+\
                     'state ({0}) before timeout:\n'.format(acceptable)+\
                     '\tLast status was "{0}".\n'.format(image['status'])
-
-        # See Salt issue #24568
-        warn_until('Boron', 'Starting with Boron '
-            '\'_find_image()\' is not supposed to return '
-            'the image wrapped in a dict anymore.')
-        if len(image.keys()) == 1:
-            image = image.values()[0]
-            # ret[comment] +=
 
     # There's no image but where would I get one??
     elif location is None:
@@ -189,12 +189,6 @@ def image_present(name, visibility='public', protected=None,
             if not __opts__['test']:
                 image = __salt__['glance.image_update'](
                     id=image['id'], visibility=visibility)
-            # See Salt issue #24568
-            warn_until('Boron', 'Starting with Boron '
-                '\'glance.image_update\' is not supposed to return '
-                'the image wrapped in a dict anymore.')
-            if len(image.keys()) == 1:
-                image = image.values()[0]
             # Check if image_update() worked:
             if image['visibility'] != visibility:
                 if not __opts__['test']:
@@ -232,11 +226,6 @@ def image_present(name, visibility='public', protected=None,
             if 'checksum' not in image:
                 # Refresh our info about the image
                 image = __salt__['glance.image_show'](image['id'])
-                warn_until('Boron', 'Starting with Boron '
-                    '\'glance.image_show\' is not supposed to return '
-                    'the image wrapped in a dict anymore.')
-                if len(image.keys()) == 1:
-                    image = image.values()[0]
             if 'checksum' not in image:
                 if not __opts__['test']:
                     ret['result'] = False

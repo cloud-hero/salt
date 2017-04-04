@@ -6,7 +6,9 @@ from __future__ import absolute_import
 
 # Import salt libs
 import salt.client.ssh
+import salt.utils.files
 import logging
+import os
 from salt.exceptions import CommandExecutionError
 
 log = logging.getLogger(__name__)
@@ -33,7 +35,10 @@ def get_file(path,
     if template is not None:
         (path, dest) = _render_filenames(path, dest, saltenv, template)
 
-    src = __context__['fileclient'].cache_file(path, saltenv)
+    src = __context__['fileclient'].cache_file(
+        path,
+        saltenv,
+        cachedir=os.path.join('salt-ssh', __salt__.kwargs['id_']))
     single = salt.client.ssh.Single(
             __opts__,
             '',
@@ -46,7 +51,10 @@ def get_dir(path, dest, saltenv='base'):
     '''
     Transfer a directory down
     '''
-    src = __context__['fileclient'].cache_dir(path, saltenv)
+    src = __context__['fileclient'].cache_dir(
+        path,
+        saltenv,
+        cachedir=os.path.join('salt-ssh', __salt__.kwargs['id_']))
     src = ' '.join(src)
     single = salt.client.ssh.Single(
             __opts__,
@@ -58,9 +66,12 @@ def get_dir(path, dest, saltenv='base'):
 
 def get_url(path, dest, saltenv='base'):
     '''
-    retrive a URL
+    retrieve a URL
     '''
-    src = __context__['fileclient'].get_url(path, saltenv)
+    src = __context__['fileclient'].cache_file(
+        path,
+        saltenv,
+        cachedir=os.path.join('salt-ssh', __salt__.kwargs['id_']))
     single = salt.client.ssh.Single(
             __opts__,
             '',
@@ -126,7 +137,7 @@ def _render_filenames(path, dest, saltenv, template):
         temp file, rendering that file, and returning the result.
         '''
         # write out path to temp file
-        tmp_path_fn = salt.utils.mkstemp()
+        tmp_path_fn = salt.utils.files.mkstemp()
         with salt.utils.fopen(tmp_path_fn, 'w+') as fp_:
             fp_.write(contents)
         data = salt.utils.templates.TEMPLATE_REGISTRY[template](

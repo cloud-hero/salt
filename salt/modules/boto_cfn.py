@@ -5,7 +5,7 @@ Connection module for Amazon Cloud Formation
 .. versionadded:: 2015.5.0
 
 :configuration: This module accepts explicit AWS credentials but can also utilize
-    IAM roles assigned to the instance trough Instance Profiles. Dynamic
+    IAM roles assigned to the instance through Instance Profiles. Dynamic
     credentials are then automatically obtained from AWS API and no further
     configuration is necessary. More Information available at:
 
@@ -58,13 +58,13 @@ def __virtual__():
     Only load if boto libraries exist.
     '''
     if not HAS_BOTO:
-        return False
+        return (False, 'The module boto_cfs could not be loaded: boto libraries not found')
     return True
 
 
 def __init__(opts):
     if HAS_BOTO:
-        __utils__['boto.assign_funcs'](__name__, 'cfn', module='cloudformation')
+        __utils__['boto.assign_funcs'](__name__, 'cfn', module='cloudformation', pack=__salt__)
 
 
 def exists(name, region=None, key=None, keyid=None, profile=None):

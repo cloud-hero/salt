@@ -8,7 +8,7 @@ The OpenNebula cloud module is used to control access to an OpenNebula cloud.
 .. versionadded:: 2014.7.0
 
 :depends: lxml
-:depends: OpenNebula installation running version ``4.14``.
+:depends: OpenNebula installation running version ``4.14`` or later.
 
 Use of this module requires the ``xml_rpc``, ``user``, and ``password``
 parameters to be set.
@@ -23,6 +23,21 @@ Set up the cloud configuration at ``/etc/salt/cloud.providers`` or
       user: oneadmin
       password: JHGhgsayu32jsa
       driver: opennebula
+
+This driver supports accessing new VM instances via DNS entry instead
+of IP address.  To enable this feature, in the provider or profile file
+add `fqdn_base` with a value matching the base of your fully-qualified
+domain name.  Example:
+
+.. code-block:: yaml
+
+    my-opennebula-config:
+      [...]
+      fqdn_base: <my.basedomain.com>
+      [...]
+
+The driver will prepend the hostname to the fqdn_base and do a DNS lookup
+to find the IP of the new VM.
 
 .. note:
 
@@ -61,10 +76,7 @@ from salt.exceptions import (
     SaltCloudNotFound,
     SaltCloudSystemExit
 )
-from salt.utils import is_true
-
-# Import Salt Cloud Libs
-import salt.utils.cloud
+import salt.utils
 
 # Import Third Party Libs
 try:
@@ -73,6 +85,7 @@ try:
     HAS_XML_LIBS = True
 except ImportError:
     HAS_XML_LIBS = False
+
 
 # Get Logging Started
 log = logging.getLogger(__name__)
@@ -135,10 +148,11 @@ def avail_images(call=None):
 
     server, user, password = _get_xml_rpc()
     auth = ':'.join([user, password])
-    image_pool = server.one.imagepool.info(auth, -1, -1, -1)[1]
+
+    image_pool = server.one.imagepool.info(auth, -2, -1, -1)[1]
 
     images = {}
-    for image in etree.XML(image_pool):
+    for image in _get_xml(image_pool):
         images[image.find('NAME').text] = _xml_to_dict(image)
 
     return images
@@ -168,7 +182,7 @@ def avail_locations(call=None):
     host_pool = server.one.hostpool.info(auth)[1]
 
     locations = {}
-    for host in etree.XML(host_pool):
+    for host in _get_xml(host_pool):
         locations[host.find('NAME').text] = _xml_to_dict(host)
 
     return locations
@@ -197,7 +211,7 @@ def list_clusters(call=None):
     '''
     Returns a list of clusters in OpenNebula.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -215,7 +229,7 @@ def list_clusters(call=None):
     cluster_pool = server.one.clusterpool.info(auth)[1]
 
     clusters = {}
-    for cluster in etree.XML(cluster_pool):
+    for cluster in _get_xml(cluster_pool):
         clusters[cluster.find('NAME').text] = _xml_to_dict(cluster)
 
     return clusters
@@ -225,7 +239,7 @@ def list_datastores(call=None):
     '''
     Returns a list of data stores on OpenNebula.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -243,7 +257,7 @@ def list_datastores(call=None):
     datastore_pool = server.one.datastorepool.info(auth)[1]
 
     datastores = {}
-    for datastore in etree.XML(datastore_pool):
+    for datastore in _get_xml(datastore_pool):
         datastores[datastore.find('NAME').text] = _xml_to_dict(datastore)
 
     return datastores
@@ -253,7 +267,7 @@ def list_hosts(call=None):
     '''
     Returns a list of hosts on OpenNebula.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -322,7 +336,7 @@ def list_nodes_select(call=None):
             'The list_nodes_full function must be called with -f or --function.'
         )
 
-    return salt.utils.cloud.list_nodes_select(
+    return __utils__['cloud.list_nodes_select'](
         list_nodes_full('function'), __opts__['query.selection'], call,
     )
 
@@ -331,7 +345,7 @@ def list_security_groups(call=None):
     '''
     Lists all security groups available to the user and the user's groups.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -346,10 +360,10 @@ def list_security_groups(call=None):
 
     server, user, password = _get_xml_rpc()
     auth = ':'.join([user, password])
-    secgroup_pool = server.one.secgrouppool.info(auth, -1, -1, -1)[1]
+    secgroup_pool = server.one.secgrouppool.info(auth, -2, -1, -1)[1]
 
     groups = {}
-    for group in etree.XML(secgroup_pool):
+    for group in _get_xml(secgroup_pool):
         groups[group.find('NAME').text] = _xml_to_dict(group)
 
     return groups
@@ -359,7 +373,7 @@ def list_templates(call=None):
     '''
     Lists all templates available to the user and the user's groups.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -374,10 +388,10 @@ def list_templates(call=None):
 
     server, user, password = _get_xml_rpc()
     auth = ':'.join([user, password])
-    template_pool = server.one.templatepool.info(auth, -1, -1, -1)[1]
+    template_pool = server.one.templatepool.info(auth, -2, -1, -1)[1]
 
     templates = {}
-    for template in etree.XML(template_pool):
+    for template in _get_xml(template_pool):
         templates[template.find('NAME').text] = _xml_to_dict(template)
 
     return templates
@@ -387,7 +401,7 @@ def list_vns(call=None):
     '''
     Lists all virtual networks available to the user and the user's groups.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -402,10 +416,10 @@ def list_vns(call=None):
 
     server, user, password = _get_xml_rpc()
     auth = ':'.join([user, password])
-    vn_pool = server.one.vnpool.info(auth, -1, -1, -1)[1]
+    vn_pool = server.one.vnpool.info(auth, -2, -1, -1)[1]
 
     vns = {}
-    for v_network in etree.XML(vn_pool):
+    for v_network in _get_xml(vn_pool):
         vns[v_network.find('NAME').text] = _xml_to_dict(v_network)
 
     return vns
@@ -415,7 +429,7 @@ def reboot(name, call=None):
     '''
     Reboot a VM.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM to reboot.
@@ -440,7 +454,7 @@ def start(name, call=None):
     '''
     Start a VM.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM to start.
@@ -465,7 +479,7 @@ def stop(name, call=None):
     '''
     Stop a VM.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM to stop.
@@ -486,11 +500,38 @@ def stop(name, call=None):
     return vm_action(name, kwargs={'action': 'stop'}, call=call)
 
 
+def get_one_version(kwargs=None, call=None):
+    '''
+    Returns the OpenNebula version.
+
+    .. versionadded:: 2016.3.5
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt-cloud -f get_one_version one_provider_name
+    '''
+
+    if call == 'action':
+        raise SaltCloudSystemExit(
+            'The get_cluster_id function must be called with -f or --function.'
+        )
+
+    if kwargs is None:
+        kwargs = {}
+
+    server, user, password = _get_xml_rpc()
+    auth = ':'.join([user, password])
+
+    return server.one.system.version(auth)[1]
+
+
 def get_cluster_id(kwargs=None, call=None):
     '''
     Returns a cluster's ID from the given cluster name.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -526,7 +567,7 @@ def get_datastore_id(kwargs=None, call=None):
     '''
     Returns a data store's ID from the given data store name.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -562,7 +603,7 @@ def get_host_id(kwargs=None, call=None):
     '''
     Returns a host's ID from the given host name.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -595,10 +636,10 @@ def get_host_id(kwargs=None, call=None):
 
 
 def get_image(vm_):
-    '''
+    r'''
     Return the image object to use.
 
-    vm_
+    vm\_
         The VM dictionary for which to obtain an image.
     '''
     images = avail_images()
@@ -617,7 +658,7 @@ def get_image_id(kwargs=None, call=None):
     '''
     Returns an image's ID from the given image name.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -650,10 +691,10 @@ def get_image_id(kwargs=None, call=None):
 
 
 def get_location(vm_):
-    '''
+    r'''
     Return the VM's location.
 
-    vm_
+    vm\_
         The VM dictionary for which to obtain a location.
     '''
     locations = avail_locations()
@@ -679,7 +720,7 @@ def get_secgroup_id(kwargs=None, call=None):
     '''
     Returns a security group's ID from the given security group name.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -715,7 +756,7 @@ def get_template_id(kwargs=None, call=None):
     '''
     Returns a template's ID from the given template name.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -747,11 +788,32 @@ def get_template_id(kwargs=None, call=None):
     return ret
 
 
+def get_template(vm_):
+    r'''
+    Return the template id for a VM.
+
+    .. versionadded:: 2016.11.0
+
+    vm\_
+        The VM dictionary for which to obtain a template.
+    '''
+
+    vm_template = str(config.get_cloud_config_value(
+        'template', vm_, __opts__, search_global=False
+    ))
+    try:
+        return list_templates()[vm_template]['id']
+    except KeyError:
+        raise SaltCloudNotFound(
+            'The specified template, \'{0}\', could not be found.'.format(vm_template)
+        )
+
+
 def get_vm_id(kwargs=None, call=None):
     '''
     Returns a virtual machine's ID from the given virtual machine's name.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -787,7 +849,7 @@ def get_vn_id(kwargs=None, call=None):
     '''
     Returns a virtual network's ID from the given virtual network's name.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     CLI Example:
 
@@ -820,17 +882,33 @@ def get_vn_id(kwargs=None, call=None):
 
 
 def create(vm_):
-    '''
+    r'''
     Create a single VM from a data dict.
 
-    vm_
+    vm\_
         The dictionary use to create a VM.
 
-    CLI Example:
+    Optional vm_ dict options for overwriting template:
 
-    .. code-block:: bash
+    region_id
+        Optional - OpenNebula Zone ID
 
-        salt-cloud -p my-opennebula-profile vm_name
+    memory
+        Optional - In MB
+
+    cpu
+        Optional - Percent of host CPU to allocate
+
+    vcpu
+        Optional - Amount of vCPUs to allocate
+
+     CLI Example:
+
+     .. code-block:: bash
+
+         salt-cloud -p my-opennebula-profile vm_name
+
+        salt-cloud -p my-opennebula-profile vm_name memory=16384 cpu=2.5 vcpu=16
 
     '''
     try:
@@ -842,53 +920,70 @@ def create(vm_):
     except AttributeError:
         pass
 
-    # Since using "provider: <provider-engine>" is deprecated, alias provider
-    # to use driver: "driver: <provider-engine>"
-    if 'provider' in vm_:
-        vm_['driver'] = vm_.pop('provider')
-
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'starting create',
         'salt/cloud/{0}/creating'.format(vm_['name']),
-        {
-            'name': vm_['name'],
-            'profile': vm_['profile'],
-            'provider': vm_['driver'],
-        },
+        args=__utils__['cloud.filter_event']('creating', vm_, ['name', 'profile', 'provider', 'driver']),
+        sock_dir=__opts__['sock_dir'],
         transport=__opts__['transport']
     )
 
     log.info('Creating Cloud VM {0}'.format(vm_['name']))
     kwargs = {
         'name': vm_['name'],
-        'image_id': get_image(vm_),
+        'template_id': get_template(vm_),
         'region_id': get_location(vm_),
     }
+    if 'template' in vm_:
+        kwargs['image_id'] = get_template_id({'name': vm_['template']})
 
     private_networking = config.get_cloud_config_value(
         'private_networking', vm_, __opts__, search_global=False, default=None
     )
     kwargs['private_networking'] = 'true' if private_networking else 'false'
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'requesting instance',
         'salt/cloud/{0}/requesting'.format(vm_['name']),
-        {'kwargs': kwargs},
+        args={
+            'kwargs': __utils__['cloud.filter_event']('requesting', kwargs, kwargs.keys()),
+        },
+        sock_dir=__opts__['sock_dir'],
     )
 
-    region = ''
-    if kwargs['region_id'] is not None:
-        region = 'SCHED_REQUIREMENTS="ID={0}"'.format(kwargs['region_id'])
+    template = []
+    if kwargs.get('region_id'):
+        template.append('SCHED_REQUIREMENTS="ID={0}"'.format(kwargs.get('region_id')))
+    if vm_.get('memory'):
+        template.append('MEMORY={0}'.format(vm_.get('memory')))
+    if vm_.get('cpu'):
+        template.append('CPU={0}'.format(vm_.get('cpu')))
+    if vm_.get('vcpu'):
+        template.append('VCPU={0}'.format(vm_.get('vcpu')))
+    template_args = "\n".join(template)
+
     try:
         server, user, password = _get_xml_rpc()
         auth = ':'.join([user, password])
-        server.one.template.instantiate(auth,
-                                        int(kwargs['image_id']),
+        cret = server.one.template.instantiate(auth,
+                                        int(kwargs['template_id']),
                                         kwargs['name'],
                                         False,
-                                        region)
+                                        template_args)
+        if not cret[0]:
+            log.error(
+                'Error creating {0} on OpenNebula\n\n'
+                'The following error was returned when trying to '
+                'instantiate the template: {1}'.format(
+                    vm_['name'],
+                    cret[1]
+                ),
+                # Show the traceback if the debug logging level is enabled
+                exc_info_on_loglevel=logging.DEBUG
+            )
+            return False
     except Exception as exc:
         log.error(
             'Error creating {0} on OpenNebula\n\n'
@@ -902,6 +997,10 @@ def create(vm_):
         )
         return False
 
+    fqdn = vm_.get('fqdn_base')
+    if fqdn is not None:
+        fqdn = '{0}.{1}'.format(vm_['name'], fqdn)
+
     def __query_node_data(vm_name):
         node_data = show_instance(vm_name, call='action')
         if not node_data:
@@ -913,7 +1012,7 @@ def create(vm_):
             return node_data
 
     try:
-        data = salt.utils.cloud.wait_for_ip(
+        data = __utils__['cloud.wait_for_ip'](
             __query_node_data,
             update_args=(vm_['name'],),
             timeout=config.get_cloud_config_value(
@@ -940,10 +1039,21 @@ def create(vm_):
             )
         )
 
-    try:
-        private_ip = data['private_ips'][0]
-    except KeyError:
-        private_ip = data['template']['nic']['ip']
+    if fqdn:
+        vm_['ssh_host'] = fqdn
+        private_ip = '0.0.0.0'
+    else:
+        try:
+            private_ip = data['private_ips'][0]
+        except KeyError:
+            try:
+                private_ip = data['template']['nic']['ip']
+            except KeyError:
+                # if IPv6 is used try this as last resort
+                # OpenNebula does not yet show ULA address here so take global
+                private_ip = data['template']['nic']['ip6_global']
+
+            vm_['ssh_host'] = private_ip
 
     ssh_username = config.get_cloud_config_value(
         'ssh_username', vm_, __opts__, default='root'
@@ -951,9 +1061,8 @@ def create(vm_):
 
     vm_['username'] = ssh_username
     vm_['key_filename'] = key_filename
-    vm_['ssh_host'] = private_ip
 
-    ret = salt.utils.cloud.bootstrap(vm_, __opts__)
+    ret = __utils__['cloud.bootstrap'](vm_, __opts__)
 
     ret['id'] = data['id']
     ret['image'] = vm_['image']
@@ -970,15 +1079,12 @@ def create(vm_):
         )
     )
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'created instance',
         'salt/cloud/{0}/created'.format(vm_['name']),
-        {
-            'name': vm_['name'],
-            'profile': vm_['profile'],
-            'provider': vm_['driver'],
-        },
+        args=__utils__['cloud.filter_event']('created', vm_, ['name', 'profile', 'provider', 'driver']),
+        sock_dir=__opts__['sock_dir'],
     )
 
     return ret
@@ -1007,11 +1113,12 @@ def destroy(name, call=None):
             '-a or --action.'
         )
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'destroying instance',
         'salt/cloud/{0}/destroying'.format(name),
-        {'name': name},
+        args={'name': name},
+        sock_dir=__opts__['sock_dir'],
     )
 
     server, user, password = _get_xml_rpc()
@@ -1020,15 +1127,16 @@ def destroy(name, call=None):
     data = show_instance(name, call='action')
     node = server.one.vm.action(auth, 'delete', int(data['id']))
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'destroyed instance',
         'salt/cloud/{0}/destroyed'.format(name),
-        {'name': name},
+        args={'name': name},
+        sock_dir=__opts__['sock_dir'],
     )
 
     if __opts__.get('update_cachedir', False) is True:
-        salt.utils.cloud.delete_minion_cachedir(
+        __utils__['cloud.delete_minion_cachedir'](
             name,
             __active_provider_name__.split(':')[0],
             __opts__
@@ -1048,7 +1156,7 @@ def image_allocate(call=None, kwargs=None):
     '''
     Allocates a new image in OpenNebula.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     path
         The path to a file containing the template of the image to allocate.
@@ -1135,7 +1243,7 @@ def image_clone(call=None, kwargs=None):
     '''
     Clones an existing image.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the new image.
@@ -1204,7 +1312,7 @@ def image_delete(call=None, kwargs=None):
     Deletes the given image from OpenNebula. Either a name or an image_id must
     be supplied.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the image to delete. Can be used instead of ``image_id``.
@@ -1263,7 +1371,7 @@ def image_info(call=None, kwargs=None):
     Retrieves information for a given image. Either a name or an image_id must be
     supplied.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the image for which to gather information. Can be used instead
@@ -1310,7 +1418,7 @@ def image_info(call=None, kwargs=None):
 
     info = {}
     response = server.one.image.info(auth, int(image_id))[1]
-    tree = etree.XML(response)
+    tree = _get_xml(response)
     info[tree.find('NAME').text] = _xml_to_dict(tree)
 
     return info
@@ -1320,7 +1428,7 @@ def image_persistent(call=None, kwargs=None):
     '''
     Sets the Image as persistent or not persistent.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the image to set. Can be used instead of ``image_id``.
@@ -1373,7 +1481,7 @@ def image_persistent(call=None, kwargs=None):
 
     server, user, password = _get_xml_rpc()
     auth = ':'.join([user, password])
-    response = server.one.image.persistent(auth, int(image_id), is_true(persist))
+    response = server.one.image.persistent(auth, int(image_id), salt.utils.is_true(persist))
 
     data = {
         'action': 'image.persistent',
@@ -1389,7 +1497,7 @@ def image_snapshot_delete(call=None, kwargs=None):
     '''
     Deletes a snapshot from the image.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     image_id
         The ID of the image from which to delete the snapshot. Can be used instead of
@@ -1458,7 +1566,7 @@ def image_snapshot_revert(call=None, kwargs=None):
     '''
     Reverts an image state to a previous snapshot.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     image_id
         The ID of the image to revert. Can be used instead of ``image_name``.
@@ -1525,7 +1633,7 @@ def image_snapshot_flatten(call=None, kwargs=None):
     '''
     Flattens the snapshot of an image and discards others.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     image_id
         The ID of the image. Can be used instead of ``image_name``.
@@ -1593,7 +1701,7 @@ def image_update(call=None, kwargs=None):
     '''
     Replaces the image template contents.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     image_id
         The ID of the image to update. Can be used instead of ``image_name``.
@@ -1720,7 +1828,7 @@ def show_instance(name, call=None):
         )
 
     node = _get_node(name)
-    salt.utils.cloud.cache_node(node, __active_provider_name__, __opts__)
+    __utils__['cloud.cache_node'](node, __active_provider_name__, __opts__)
 
     return node
 
@@ -1729,7 +1837,7 @@ def secgroup_allocate(call=None, kwargs=None):
     '''
     Allocates a new security group in OpenNebula.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     path
         The path to a file containing the template of the security group. Syntax
@@ -1792,7 +1900,7 @@ def secgroup_clone(call=None, kwargs=None):
     '''
     Clones an existing security group.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the new template.
@@ -1863,7 +1971,7 @@ def secgroup_delete(call=None, kwargs=None):
     Deletes the given security group from OpenNebula. Either a name or a secgroup_id
     must be supplied.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the security group to delete. Can be used instead of
@@ -1923,7 +2031,7 @@ def secgroup_info(call=None, kwargs=None):
     Retrieves information for the given security group. Either a name or a
     secgroup_id must be supplied.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the security group for which to gather information. Can be
@@ -1970,7 +2078,7 @@ def secgroup_info(call=None, kwargs=None):
 
     info = {}
     response = server.one.secgroup.info(auth, int(secgroup_id))[1]
-    tree = etree.XML(response)
+    tree = _get_xml(response)
     info[tree.find('NAME').text] = _xml_to_dict(tree)
 
     return info
@@ -1980,7 +2088,7 @@ def secgroup_update(call=None, kwargs=None):
     '''
     Replaces the security group template contents.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     secgroup_id
         The ID of the security group to update. Can be used instead of
@@ -2091,7 +2199,7 @@ def template_allocate(call=None, kwargs=None):
     '''
     Allocates a new template in OpenNebula.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     path
         The path to a file containing the elements of the template to be allocated.
@@ -2156,7 +2264,7 @@ def template_clone(call=None, kwargs=None):
     '''
     Clones an existing virtual machine template.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the new template.
@@ -2226,7 +2334,7 @@ def template_delete(call=None, kwargs=None):
     Deletes the given template from OpenNebula. Either a name or a template_id must
     be supplied.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the template to delete. Can be used instead of ``template_id``.
@@ -2284,7 +2392,7 @@ def template_instantiate(call=None, kwargs=None):
     '''
     Instantiates a new virtual machine from a template.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     .. note::
         ``template_instantiate`` creates a VM on OpenNebula from a template, but it
@@ -2359,7 +2467,7 @@ def template_update(call=None, kwargs=None):
     '''
     Replaces the template contents.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     template_id
         The ID of the template to update. Can be used instead of ``template_name``.
@@ -2470,7 +2578,7 @@ def vm_action(name, kwargs=None, call=None):
     '''
     Submits an action to be performed on a given virtual machine.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM to action.
@@ -2535,7 +2643,7 @@ def vm_allocate(call=None, kwargs=None):
     '''
     Allocates a new virtual machine in OpenNebula.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     path
         The path to a file defining the template of the VM to allocate.
@@ -2586,7 +2694,7 @@ def vm_allocate(call=None, kwargs=None):
 
     server, user, password = _get_xml_rpc()
     auth = ':'.join([user, password])
-    response = server.one.vm.allocate(auth, data, is_true(hold))
+    response = server.one.vm.allocate(auth, data, salt.utils.is_true(hold))
 
     ret = {
         'action': 'vm.allocate',
@@ -2602,7 +2710,7 @@ def vm_attach(name, kwargs=None, call=None):
     '''
     Attaches a new disk to the given virtual machine.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM for which to attach the new disk.
@@ -2668,7 +2776,7 @@ def vm_attach_nic(name, kwargs=None, call=None):
     '''
     Attaches a new network interface to the given virtual machine.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM for which to attach the new network interface.
@@ -2734,7 +2842,7 @@ def vm_deploy(name, kwargs=None, call=None):
     '''
     Initiates the instance of the given VM on the target host.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM to deploy.
@@ -2816,7 +2924,7 @@ def vm_deploy(name, kwargs=None, call=None):
     response = server.one.vm.deploy(auth,
                                     int(vm_id),
                                     int(host_id),
-                                    is_true(capacity_maintained),
+                                    salt.utils.is_true(capacity_maintained),
                                     int(datastore_id))
 
     data = {
@@ -2833,7 +2941,7 @@ def vm_detach(name, kwargs=None, call=None):
     '''
     Detaches a disk from a virtual machine.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM from which to detach the disk.
@@ -2880,7 +2988,7 @@ def vm_detach_nic(name, kwargs=None, call=None):
     '''
     Detaches a disk from a virtual machine.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM from which to detach the network interface.
@@ -2927,7 +3035,7 @@ def vm_disk_save(name, kwargs=None, call=None):
     '''
     Sets the disk to be saved in the given image.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM containing the disk to save.
@@ -2997,7 +3105,7 @@ def vm_disk_snapshot_create(name, kwargs=None, call=None):
     '''
     Takes a new snapshot of the disk image.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM of which to take the snapshot.
@@ -3053,7 +3161,7 @@ def vm_disk_snapshot_delete(name, kwargs=None, call=None):
     '''
     Deletes a disk snapshot based on the given VM and the disk_id.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM containing the snapshot to delete.
@@ -3109,7 +3217,7 @@ def vm_disk_snapshot_revert(name, kwargs=None, call=None):
     '''
     Reverts a disk state to a previously taken snapshot.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM containing the snapshot.
@@ -3165,7 +3273,7 @@ def vm_info(name, call=None):
     '''
     Retrieves information for a given virtual machine. A VM name must be supplied.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM for which to gather information.
@@ -3190,7 +3298,7 @@ def vm_info(name, call=None):
         return response[1]
     else:
         info = {}
-        tree = etree.XML(response[1])
+        tree = _get_xml(response[1])
         info[tree.find('NAME').text] = _xml_to_dict(tree)
         return info
 
@@ -3199,7 +3307,7 @@ def vm_migrate(name, kwargs=None, call=None):
     '''
     Migrates the specified virtual machine to the specified target host.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM to migrate.
@@ -3285,8 +3393,8 @@ def vm_migrate(name, kwargs=None, call=None):
     response = server.one.vm.migrate(auth,
                                      vm_id,
                                      int(host_id),
-                                     is_true(live_migration),
-                                     is_true(capacity_maintained),
+                                     salt.utils.is_true(live_migration),
+                                     salt.utils.is_true(capacity_maintained),
                                      int(datastore_id))
 
     data = {
@@ -3308,7 +3416,7 @@ def vm_monitoring(name, call=None):
     contains the complete dictionary of the VM with the updated information returned
     by the poll action.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM for which to gather monitoring records.
@@ -3337,7 +3445,7 @@ def vm_monitoring(name, call=None):
         return {}
     else:
         info = {}
-        for vm_ in etree.XML(response[1]):
+        for vm_ in _get_xml(response[1]):
             info[vm_.find('ID').text] = _xml_to_dict(vm_)
         return info
 
@@ -3346,7 +3454,7 @@ def vm_resize(name, kwargs=None, call=None):
     '''
     Changes the capacity of the virtual machine.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM to resize.
@@ -3404,7 +3512,7 @@ def vm_resize(name, kwargs=None, call=None):
     server, user, password = _get_xml_rpc()
     auth = ':'.join([user, password])
     vm_id = int(get_vm_id(kwargs={'name': name}))
-    response = server.one.vm.resize(auth, vm_id, data, is_true(capacity_maintained))
+    response = server.one.vm.resize(auth, vm_id, data, salt.utils.is_true(capacity_maintained))
 
     ret = {
         'action': 'vm.resize',
@@ -3420,7 +3528,7 @@ def vm_snapshot_create(vm_name, kwargs=None, call=None):
     '''
     Creates a new virtual machine snapshot from the provided VM.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     vm_name
         The name of the VM from which to create the snapshot.
@@ -3467,7 +3575,7 @@ def vm_snapshot_delete(vm_name, kwargs=None, call=None):
     '''
     Deletes a virtual machine snapshot from the provided VM.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     vm_name
         The name of the VM from which to delete the snapshot.
@@ -3514,7 +3622,7 @@ def vm_snapshot_revert(vm_name, kwargs=None, call=None):
     '''
     Reverts a virtual machine to a snapshot
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     vm_name
         The name of the VM to revert.
@@ -3561,7 +3669,7 @@ def vm_update(name, kwargs=None, call=None):
     '''
     Replaces the user template contents.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the VM to update.
@@ -3647,7 +3755,7 @@ def vn_add_ar(call=None, kwargs=None):
     '''
     Adds address ranges to a given virtual network.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     vn_id
         The ID of the virtual network to add the address range. Can be used
@@ -3733,7 +3841,7 @@ def vn_allocate(call=None, kwargs=None):
     '''
     Allocates a new virtual network in OpenNebula.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     path
         The path to a file containing the template of the virtual network to allocate.
@@ -3817,7 +3925,7 @@ def vn_delete(call=None, kwargs=None):
     Deletes the given virtual network from OpenNebula. Either a name or a vn_id must
     be supplied.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the virtual network to delete. Can be used instead of ``vn_id``.
@@ -3875,7 +3983,7 @@ def vn_free_ar(call=None, kwargs=None):
     '''
     Frees a reserved address range from a virtual network.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     vn_id
         The ID of the virtual network from which to free an address range.
@@ -3944,7 +4052,7 @@ def vn_hold(call=None, kwargs=None):
     '''
     Holds a virtual network lease as used.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     vn_id
         The ID of the virtual network from which to hold the lease. Can be used
@@ -4029,7 +4137,7 @@ def vn_info(call=None, kwargs=None):
     '''
     Retrieves information for the virtual network.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     name
         The name of the virtual network for which to gather information. Can be
@@ -4079,7 +4187,7 @@ def vn_info(call=None, kwargs=None):
         return response[1]
     else:
         info = {}
-        tree = etree.XML(response[1])
+        tree = _get_xml(response[1])
         info[tree.find('NAME').text] = _xml_to_dict(tree)
         return info
 
@@ -4088,7 +4196,7 @@ def vn_release(call=None, kwargs=None):
     '''
     Releases a virtual network lease that was previously on hold.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     vn_id
         The ID of the virtual network from which to release the lease. Can be
@@ -4173,7 +4281,7 @@ def vn_reserve(call=None, kwargs=None):
     '''
     Reserve network addresses.
 
-    .. versionadded:: Boron
+    .. versionadded:: 2016.3.0
 
     vn_id
         The ID of the virtual network from which to reserve addresses. Can be used
@@ -4283,6 +4391,21 @@ def _get_node(name):
     return {}
 
 
+def _get_xml(xml_str):
+    '''
+    Intrepret the data coming from opennebula and raise if it's not XML.
+    '''
+    try:
+        xml_data = etree.XML(xml_str)
+    # XMLSyntaxError seems to be only available from lxml, but that is the xml
+    # library loaded by this module
+    except etree.XMLSyntaxError as err:
+        # opennebula returned invalid XML, which could be an error message, so
+        # log it
+        raise SaltCloudSystemExit('opennebula returned: {0}'.format(xml_str))
+    return xml_data
+
+
 def _get_xml_rpc():
     '''
     Uses the OpenNebula cloud provider configurations to connect to the
@@ -4322,10 +4445,10 @@ def _list_nodes(full=False):
     server, user, password = _get_xml_rpc()
     auth = ':'.join([user, password])
 
-    vm_pool = server.one.vmpool.info(auth, -1, -1, -1, -1)[1]
+    vm_pool = server.one.vmpool.info(auth, -2, -1, -1, -1)[1]
 
     vms = {}
-    for vm in etree.XML(vm_pool):
+    for vm in _get_xml(vm_pool):
         name = vm.find('NAME').text
         vms[name] = {}
 
@@ -4334,7 +4457,10 @@ def _list_nodes(full=False):
 
         private_ips = []
         for nic in vm.find('TEMPLATE').findall('NIC'):
-            private_ips.append(nic.find('IP').text)
+            try:
+                private_ips.append(nic.find('IP').text)
+            except Exception:
+                pass
 
         vms[name]['id'] = vm.find('ID').text
         vms[name]['image'] = vm.find('TEMPLATE').find('TEMPLATE_ID').text

@@ -6,7 +6,7 @@ CloudStack Cloud Module
 The CloudStack cloud module is used to control access to a CloudStack based
 Public Cloud.
 
-:depends: libcloud
+:depends: libcloud >= 0.15
 
 Use of this module requires the ``apikey``, ``secretkey``, ``host`` and
 ``path`` parameters.
@@ -38,6 +38,9 @@ from salt.exceptions import SaltCloudSystemExit
 # pylint: disable=import-error
 try:
     from libcloud.compute.drivers.cloudstack import CloudStackNetwork
+    # See https://github.com/saltstack/salt/issues/32743
+    import libcloud.security
+    libcloud.security.CA_CERTS_PATH.append('/etc/ssl/certs/YaST-CA.pem')
     HAS_LIBS = True
 except ImportError:
     HAS_LIBS = False
@@ -155,6 +158,14 @@ def get_location(conn, vm_):
             return location
 
 
+def get_security_groups(conn, vm_):
+    '''
+    Return a list of security groups to use, defaulting to ['default']
+    '''
+    return config.get_cloud_config_value('securitygroup', vm_, __opts__,
+                                         default=['default'])
+
+
 def get_password(vm_):
     '''
     Return the password to use
@@ -216,7 +227,12 @@ def get_project(conn, vm_):
     '''
     Return the project to use.
     '''
-    projects = conn.ex_list_projects()
+    try:
+        projects = conn.ex_list_projects()
+    except AttributeError:
+        # with versions <0.15 of libcloud this is causing an AttributeError.
+        log.warning('Cannot get projects, you may need to update libcloud to 0.15 or later')
+        return False
     projid = config.get_cloud_config_value('projectid', vm_, __opts__)
 
     if not projid:
@@ -238,20 +254,17 @@ def create(vm_):
         # Check for required profile parameters before sending any API calls.
         if vm_['profile'] and config.is_profile_configured(__opts__,
                                                            __active_provider_name__ or 'cloudstack',
-                                                           vm_['profile']) is False:
+                                                           vm_['profile'],
+                                                           vm_=vm_) is False:
             return False
     except AttributeError:
         pass
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'starting create',
         'salt/cloud/{0}/creating'.format(vm_['name']),
-        {
-            'name': vm_['name'],
-            'profile': vm_['profile'],
-            'provider': vm_['provider'],
-        },
+        args=__utils__['cloud.filter_event']('creating', vm_, ['name', 'profile', 'provider', 'driver']),
         transport=__opts__['transport']
     )
 
@@ -262,6 +275,7 @@ def create(vm_):
         'image': get_image(conn, vm_),
         'size': get_size(conn, vm_),
         'location': get_location(conn, vm_),
+        'ex_security_groups': get_security_groups(conn, vm_)
     }
 
     if get_keypair(vm_) is not False:
@@ -278,13 +292,21 @@ def create(vm_):
     if get_project(conn, vm_) is not False:
         kwargs['project'] = get_project(conn, vm_)
 
-    salt.utils.cloud.fire_event(
+    event_data = kwargs.copy()
+    event_data['image'] = kwargs['image'].name
+    event_data['size'] = kwargs['size'].name
+
+    __utils__['cloud.fire_event'](
         'event',
         'requesting instance',
         'salt/cloud/{0}/requesting'.format(vm_['name']),
-        {'kwargs': {'name': kwargs['name'],
-                    'image': kwargs['image'].name,
-                    'size': kwargs['size'].name}},
+        args={
+            'kwargs': __utils__['cloud.filter_event'](
+                'requesting',
+                event_data,
+                ['name', 'profile', 'provider', 'driver', 'image', 'size'],
+            ),
+        },
         transport=__opts__['transport']
     )
 
@@ -300,7 +322,7 @@ def create(vm_):
         for ex_blockdevicemapping in ex_blockdevicemappings:
             if 'VirtualName' not in ex_blockdevicemapping:
                 ex_blockdevicemapping['VirtualName'] = '{0}-{1}'.format(vm_['name'], len(volumes))
-            salt.utils.cloud.fire_event(
+            __utils__['cloud.fire_event'](
               'event',
               'requesting volume',
               'salt/cloud/{0}/requesting'.format(ex_blockdevicemapping['VirtualName']),
@@ -362,7 +384,7 @@ def create(vm_):
     vm_['ssh_host'] = get_ip(data)
     vm_['password'] = data.extra['password']
     vm_['key_filename'] = get_key()
-    ret = salt.utils.cloud.bootstrap(vm_, __opts__)
+    ret = __utils__['cloud.bootstrap'](vm_, __opts__)
 
     ret.update(data.__dict__)
 
@@ -376,15 +398,11 @@ def create(vm_):
         )
     )
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'created instance',
         'salt/cloud/{0}/created'.format(vm_['name']),
-        {
-            'name': vm_['name'],
-            'profile': vm_['profile'],
-            'provider': vm_['provider'],
-        },
+        args=__utils__['cloud.filter_event']('created', vm_, ['name', 'profile', 'provider', 'driver']),
         transport=__opts__['transport']
     )
 
@@ -401,7 +419,7 @@ def destroy(name, conn=None, call=None):
             '-a or --action.'
         )
 
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'destroying instance',
         'salt/cloud/{0}/destroying'.format(name),
@@ -425,7 +443,7 @@ def destroy(name, conn=None, call=None):
             )
             continue
         log.info('Detaching volume: {0}'.format(volume.name))
-        salt.utils.cloud.fire_event(
+        __utils__['cloud.fire_event'](
             'event',
             'detaching volume',
             'salt/cloud/{0}/detaching'.format(volume.name),
@@ -435,7 +453,7 @@ def destroy(name, conn=None, call=None):
             log.error('Failed to Detach volume: {0}'.format(volume.name))
             return False
         log.info('Detached volume: {0}'.format(volume.name))
-        salt.utils.cloud.fire_event(
+        __utils__['cloud.fire_event'](
             'event',
             'detached volume',
             'salt/cloud/{0}/detached'.format(volume.name),
@@ -443,7 +461,7 @@ def destroy(name, conn=None, call=None):
         )
 
         log.info('Destroying volume: {0}'.format(volume.name))
-        salt.utils.cloud.fire_event(
+        __utils__['cloud.fire_event'](
             'event',
             'destroying volume',
             'salt/cloud/{0}/destroying'.format(volume.name),
@@ -453,7 +471,7 @@ def destroy(name, conn=None, call=None):
             log.error('Failed to Destroy volume: {0}'.format(volume.name))
             return False
         log.info('Destroyed volume: {0}'.format(volume.name))
-        salt.utils.cloud.fire_event(
+        __utils__['cloud.fire_event'](
             'event',
             'destroyed volume',
             'salt/cloud/{0}/destroyed'.format(volume.name),
@@ -467,7 +485,7 @@ def destroy(name, conn=None, call=None):
     log.info('Destroyed VM: {0}'.format(name))
     # Fire destroy action
     event = salt.utils.event.SaltEvent('master', __opts__['sock_dir'])
-    salt.utils.cloud.fire_event(
+    __utils__['cloud.fire_event'](
         'event',
         'destroyed instance',
         'salt/cloud/{0}/destroyed'.format(name),
